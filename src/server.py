@@ -737,10 +737,13 @@ class HHServer(socketserver.ThreadingTCPServer):
         store = self.store
         if store is None:
             return
+        # the existence check and the write share one lock hold: if they were
+        # split, a concurrent eviction could delete this block's parent between
+        # them and the insert would fail its foreign key
         with self._registry_lock:
             if self._agents.get(block.id) is not block:
                 return
-        dropped = store.save(block)
+            dropped = store.save(block)
         if dropped:
             conn.send(
                 "persist_warning",
@@ -762,23 +765,27 @@ class HHServer(socketserver.ThreadingTCPServer):
         if store is None or store.max_bytes <= 0:
             return
         while store.size_bytes() > store.max_bytes:
-            running = {
-                agent_id
-                for agent_id, candidate in self._agents.items()
-                if candidate.running
-            }
-            victim: sqlite3.Row | None = None
-            victim_ids: set[str] = set()
-            for row in store.candidates():
-                ids = set(store.subtree_ids(row["root"]))
-                if ids & running:
-                    continue
-                victim, victim_ids = row, ids
-                break
-            if victim is None:
-                break  # everything left is protected; retry on the next write
-            store.delete(victim["root"])
             with self._registry_lock:
+                # picking a victim, deleting its rows and dropping it from the
+                # registry share one lock hold: they are all writes to the same
+                # two structures, and a turn writing the same subtree must not
+                # slip between them (its insert would fail the foreign key)
+                running = {
+                    agent_id
+                    for agent_id, candidate in self._agents.items()
+                    if candidate.running
+                }
+                victim: sqlite3.Row | None = None
+                victim_ids: set[str] = set()
+                for row in store.candidates():
+                    ids = set(store.subtree_ids(row["root"]))
+                    if ids & running:
+                        continue
+                    victim, victim_ids = row, ids
+                    break
+                if victim is None:
+                    break  # all protected; retry on the next write
+                store.delete(victim["root"])
                 for agent_id in victim_ids:
                     self._agents.pop(agent_id, None)
             conn.send(

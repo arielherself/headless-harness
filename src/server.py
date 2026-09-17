@@ -486,7 +486,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             include_usage=child.include_usage,
             verbose=child.verbose,
             tools=sorted(child.tools),
-            state_tools=child.state_tools(),
+            state_namespaces=child.state_namespaces(),
         )
         self.persist(conn, child)
 
@@ -610,14 +610,15 @@ class HHServer(socketserver.ThreadingTCPServer):
         tool = command.get("tool")
         if tool is not None and (not isinstance(tool, str) or not tool):
             raise HHTcpError("bad_field", "'tool' must be a non-empty string")
-        names = [tool] if tool else block.state_tools()
+        names = [namespace_for(tool)] if tool else block.state_namespaces()
         conn.send(
             "state",
             rid=rid,
             agent_id=agent_id,
             depth=block.depth,
             path=block.path(),
-            tools=names,
+            tool=tool,
+            keys=names,
             state={name: block.merged_state(name) for name in names},
         )
 
@@ -629,6 +630,9 @@ class HHServer(socketserver.ThreadingTCPServer):
         A running block would race the turn, and a dirty one would need the seed
         folded into the turn's own diff at commit time. Seeding a finished block
         — a root, typically — is enough to give a whole subtree initial state.
+
+        `tool` names a tool, which is resolved to the namespace it shares with
+        other tools; `key` is the field inside that namespace.
         """
         agent_id = require_id(command)
         block = self.block(agent_id)
@@ -644,17 +648,18 @@ class HHServer(socketserver.ThreadingTCPServer):
         tool = command.get("tool")
         if not isinstance(tool, str) or not tool:
             raise HHTcpError("bad_field", "'tool' must be a non-empty string")
+        namespace = namespace_for(tool)
         key = command.get("key")
         if not isinstance(key, str) or not key:
             raise HHTcpError("bad_field", "'key' must be a non-empty string")
         drop = bool(command.get("delete", False))
         if not drop and "value" not in command:
             raise HHTcpError("bad_field", "set_state needs 'value', or 'delete': true")
-        replaced = key in block.merged_state(tool)
-        delta = block.state_deltas.get(tool)
+        replaced = key in block.merged_state(namespace)
+        delta = block.state_deltas.get(namespace)
         if delta is None:
             delta = StateDelta()
-            block.state_deltas[tool] = delta
+            block.state_deltas[namespace] = delta
         if drop:
             delta.changed.pop(key, None)
             if key not in delta.removed:
@@ -663,17 +668,18 @@ class HHServer(socketserver.ThreadingTCPServer):
             delta.changed[key] = command["value"]
             delta.removed = tuple(name for name in delta.removed if name != key)
         if not delta.changed and not delta.removed:
-            del block.state_deltas[tool]
+            del block.state_deltas[namespace]
         conn.send(
             "state_seeded",
             rid=rid,
             agent_id=agent_id,
             tool=tool,
+            state_namespace=namespace,
             key=key,
             value=command.get("value"),
             deleted=drop,
             replaced=replaced,
-            keys=sorted(block.merged_state(tool)),
+            keys=sorted(block.merged_state(namespace)),
         )
         self.persist(conn, block)
 
@@ -824,7 +830,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             "context_len": len(block.context()),
             "model": block.model,
             "tools": sorted(block.tools),
-            "state_tools": block.state_tools(),
+            "state_namespaces": block.state_namespaces(),
             "include_usage": block.include_usage,
             "verbose": block.verbose,
             "created_at": block.created_at,
@@ -866,6 +872,20 @@ def apply_overrides(block: HHAgent, command: dict[str, Any]) -> None:
         block.tools = {tool.name: tool for tool in select_tools(command["tools"])}
 
 
+def namespace_for(name: str) -> str:
+    """The state namespace a name refers to.
+
+    Clients address state by tool name, and a tool's state lives in the
+    namespace it shares with others of the same `state_namespace`. A name that is not
+    a known tool is taken to be a namespace already, so a tool that has since
+    been removed stays reachable.
+    """
+    for tool in builtin_tools:
+        if tool.name == name:
+            return tool.namespace
+    return name
+
+
 def select_tools(names: Any) -> list[Any]:
     """Resolve requested tool names against the builtin catalogue."""
     catalogue = {tool.name: tool for tool in builtin_tools}
@@ -892,6 +912,7 @@ def tool_catalogue() -> list[dict[str, Any]]:
         {
             "name": tool.name,
             "description": tool.description,
+            "state_namespace": tool.namespace,
             "params": [
                 {
                     "name": param.name,

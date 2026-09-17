@@ -141,10 +141,10 @@ class HHAgent:
     copies nothing else.
 
     Tool state has the same shape: a block keeps only the deltas its own turn
-    committed, under `state_deltas`, and a tool's live state is `tool_state()`,
-    the chain's deltas replayed in order. Forking a block therefore rewinds
-    every tool's memory to that point, and because a chain is linear there is
-    never anything to merge.
+    committed, under `state_deltas` keyed by state namespace, and a tool's live
+    state is `tool_state()`, the chain's deltas replayed in order. Forking a
+    block therefore rewinds every tool's memory to that point, and because a
+    chain is linear there is never anything to merge.
 
     A block runs its single turn exactly once: `fork` marks it `dirty`, and the
     turn clears that flag when it ends, however it ends. Forking from a dirty
@@ -169,6 +169,7 @@ class HHAgent:
     include_usage: bool
     verbose: bool
     on_event: EventHook | None
+    # keyed by namespace: a tool's `state_namespace`, or its name when unset
     state_deltas: dict[str, StateDelta]
     _cancel: threading.Event
     _run_lock: threading.Lock
@@ -300,8 +301,8 @@ class HHAgent:
         # this grows without bound as a chain deepens. See TODO.md.
         return [message for node in self.lineage() for message in node.messages]
 
-    def state_tools(self) -> list[str]:
-        """Names of the tools this chain has committed state deltas for."""
+    def state_namespaces(self) -> list[str]:
+        """Namespace of every state delta this chain has committed."""
         names: list[str] = []
         for node in self.lineage():
             for name in node.state_deltas:
@@ -309,40 +310,51 @@ class HHAgent:
                     names.append(name)
         return names
 
-    def merged_state(self, tool: str) -> dict[str, Any]:
-        """A tool's state as of this block.
+    def merged_state(self, namespace: str) -> dict[str, Any]:
+        """One namespace's state as of this block.
 
         The values are the stored deltas' own objects, so treat the result as
         read-only; `tool_state()` returns a copy a tool may edit in place.
         """
         state: dict[str, Any] = {}
         for node in self.lineage():
-            delta = node.state_deltas.get(tool)
+            delta = node.state_deltas.get(namespace)
             if delta is None:
                 continue
             state.update(delta.changed)
-            for key in delta.removed:
-                state.pop(key, None)
+            for name in delta.removed:
+                state.pop(name, None)
         return state
 
-    def tool_state(self, tool: str) -> dict[str, Any]:
+    def tool_state(self, namespace: str) -> dict[str, Any]:
         """A deep copy of `merged_state`, safe to hand to a tool to mutate."""
-        return copy.deepcopy(self.merged_state(tool))
+        return copy.deepcopy(self.merged_state(namespace))
 
     def all_states(self) -> dict[str, dict[str, Any]]:
-        """Every touched tool's state as of this block, for reporting."""
-        return {name: self.merged_state(name) for name in self.state_tools()}
+        """Every touched namespace's state as of this block, for reporting."""
+        return {name: self.merged_state(name) for name in self.state_namespaces()}
 
-    def _live_state(self, tool: str) -> dict[str, Any]:
-        """One tool's mutable state, loaded once per turn and kept live.
+    def tool_for(self, namespace: str) -> str:
+        """The name of a tool that shares this namespace, or the namespace.
+
+        Used for reporting: a delta is stored under its namespace, and the event
+        that announces it should also say which tool caused it.
+        """
+        for tool in self.tools.values():
+            if tool.namespace == namespace:
+                return tool.name
+        return namespace
+
+    def _live_state(self, namespace: str) -> dict[str, Any]:
+        """One namespace's mutable state, loaded once per turn and kept live.
 
         The baseline is kept next to it so the turn's diff is measured against
         the state as it stood when the turn began, not against the last call.
         """
-        if tool not in self._live_states:
-            self._state_bases[tool] = self.merged_state(tool)
-            self._live_states[tool] = copy.deepcopy(self._state_bases[tool])
-        return self._live_states[tool]
+        if namespace not in self._live_states:
+            self._state_bases[namespace] = self.merged_state(namespace)
+            self._live_states[namespace] = copy.deepcopy(self._state_bases[namespace])
+        return self._live_states[namespace]
 
     def _release_states(self, hook: EventHook | None, outcome: str) -> None:
         """Commit this turn's tool state if it succeeded, drop it otherwise.
@@ -350,34 +362,38 @@ class HHAgent:
         Called once, from the turn's `finally`, which is what makes a block's
         state atomic: a turn lands whole or not at all.
         """
-        for tool, live in self._live_states.items():
-            before = self._state_bases.get(tool, {})
+        for namespace, live in self._live_states.items():
+            before = self._state_bases.get(namespace, {})
             changed = {
-                key: value
-                for key, value in live.items()
-                if key not in before or not _same_value(before[key], value)
+                name: value
+                for name, value in live.items()
+                if name not in before or not _same_value(before[name], value)
             }
-            removed = tuple(key for key in before if key not in live)
+            removed = tuple(name for name in before if name not in live)
             if not changed and not removed:
                 continue
             if outcome != "commit":
                 self._emit(
                     hook,
                     "state_discarded",
-                    tool=tool,
+                    tool=self.tool_for(namespace),
+                    state_namespace=namespace,
                     changed=sorted(changed),
                     removed=list(removed),
                     reason=outcome,
                 )
                 continue
-            self.state_deltas[tool] = StateDelta(changed=changed, removed=removed)
+            self.state_deltas[namespace] = StateDelta(
+                changed=changed, removed=removed
+            )
             self._emit(
                 hook,
                 "state_delta",
-                tool=tool,
+                tool=self.tool_for(namespace),
+                state_namespace=namespace,
                 changed=sorted(changed),
                 removed=list(removed),
-                keys=sorted(self.merged_state(tool)),
+                keys=sorted(self.merged_state(namespace)),
             )
         self._live_states.clear()
         self._state_bases.clear()
@@ -785,7 +801,7 @@ class HHAgent:
                         call_id=call_id,
                         arguments=arguments,
                         raw_arguments=raw,
-                        state=self._live_state(name),
+                        state=self._live_state(tool.namespace),
                     )
                     self._emit(
                         hook,
@@ -793,8 +809,9 @@ class HHAgent:
                         round=round_no,
                         call_id=call_id,
                         tool=name,
+                        state_namespace=tool.namespace,
                         keys=sorted(context.state),
-                        inherited=len(self._state_bases.get(name) or {}),
+                        inherited=len(self._state_bases.get(tool.namespace) or {}),
                     )
                     text, error = _run_hook(tool, context)
             self._emit(

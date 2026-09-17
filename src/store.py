@@ -321,6 +321,7 @@ class HHStore:
                     {"name": p.name, "type": p.type, "description": p.description}
                     for p in tool.params
                 ],
+                "rollback": tool.remote_rollback,
             }
             for tool in block.tools.values()
             if tool.is_local
@@ -339,6 +340,7 @@ class HHStore:
                 for p in entry.get("params") or []
             ],
             hook=None,
+            remote_rollback=bool(entry.get("rollback")),
         )
 
     # --- encoding --------------------------------------------------------

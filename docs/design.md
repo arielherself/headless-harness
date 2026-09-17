@@ -75,6 +75,29 @@ the environment as of its parent.
 Discards are not silent: `state_discarded` names the namespace, the keys, and the
 reason (`failed`, `cancelled`, `abandoned`).
 
+### Rolling back effects outside the state
+
+Discarding a delta takes care of the state, but a tool may have done something
+else — installed a package, written a file, called an API. So a tool may declare a
+`rollback` hook (or, if it runs on the client, promise that the client has one),
+and when a turn does not commit, every call it made is offered an undo **newest
+call first**, mirroring an undo stack.
+
+Two rules make rollback safe to rely on:
+
+- **A failing rollback is contained.** It is reported as `rollback_finished` with
+  `ok: false`, and the remaining rollbacks still run. An undo that throws must not
+  strand its neighbours, and it must never replace the failure that triggered the
+  whole thing.
+- **Only calls that reached a tool are undone.** An unknown tool, or arguments
+  that never bound, did nothing and is left out — undoing it would be inventing
+  work. A client-run call that was asked and never answered *is* included, because
+  the client may have run it before going quiet.
+
+A cancelled or abandoned turn asks for its undos without waiting: the request goes
+out, no reply is waited on, and `cancel` stays responsive. A merely failed turn
+waits, because the caller is still there.
+
 ## 4. Tool state: deltas, namespaces, and deep copies
 
 Tool state uses the same shape as messages. A block stores only

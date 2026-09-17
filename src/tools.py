@@ -33,11 +33,21 @@ class ToolEntry:
     params: list[ToolParam]
     hook: Callable[..., str] | None = None
     state_namespace: str = ""
+    # undo for this tool's calls, run when a turn does not commit; for a
+    # client-run tool there is nothing callable here, so `remote_rollback`
+    # says instead that the client has one to ask for
+    rollback: Callable[..., str] | None = None
+    remote_rollback: bool = False
 
     @property
     def is_local(self) -> bool:
         """Whether the client answers this tool instead of a server-side hook."""
         return self.hook is None
+
+    @property
+    def has_rollback(self) -> bool:
+        """Whether a call to this tool can be undone at all."""
+        return self.rollback is not None or self.remote_rollback
 
     @property
     def namespace(self) -> str:
@@ -80,6 +90,8 @@ class ToolContext:
     arguments: dict[str, Any]
     raw_arguments: Any
     state: dict[str, Any]
+    # set only for a rollback: what the call being undone returned
+    result: str | None = None
 
 
 def get_current_time_executor(context: ToolContext, **arguments: Any) -> str:

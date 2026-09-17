@@ -37,8 +37,15 @@ Events
     content_delta, reasoning_delta, sse_chunk (verbose), sse_unparsed, usage,
     assistant_message, history_appended, tool_call_requested,
     tool_call_started, tool_call_finished, state_loaded, state_delta,
-    state_discarded, local_tool_called, local_tool_resolved,
-    local_tool_unresolved
+    state_discarded, local_tool_called, local_tool_rollback,
+    local_tool_resolved, local_tool_unresolved, rollback_started,
+    rollback_finished
+
+When a turn does not commit — it failed, was cancelled, or was abandoned — every
+tool it called is offered a rollback, newest call first, so effects outside the
+state can be undone. A rollback that fails is reported and skipped; the rest
+still run. Client-run tools are asked over the protocol like any other local
+call.
 
 A block may also carry `local_tools`: tools the *client* runs. They are offered
 to the model with everything else, and when one is called the server emits
@@ -98,7 +105,8 @@ COMMANDS: list[dict[str, Any]] = [
             "key": "optional, falls back to the server default",
             "model": "optional, falls back to the server default",
             "tools": "optional list of names, defaults to every builtin",
-            "local_tools": "optional list of tool definitions the client runs",
+            "local_tools": "optional list of tool definitions the client runs; "
+            "each may set \"rollback\": true to be asked to undo a failed turn",
             "timeout": "optional read timeout in seconds",
             "local_timeout": "optional seconds to wait for a local tool answer",
             "include_usage": "optional bool, ask for token accounting",
@@ -907,6 +915,9 @@ class HHServer(socketserver.ThreadingTCPServer):
             "local_tools": sorted(
                 t.name for t in block.tools.values() if t.is_local
             ),
+            "rollback_tools": sorted(
+                t.name for t in block.tools.values() if t.has_rollback
+            ),
             "waiting_on": block.pending_calls(),
             "include_usage": block.include_usage,
             "verbose": block.verbose,
@@ -1018,6 +1029,9 @@ def parse_local_tools(value: Any) -> list[ToolEntry]:
         params = entry.get("params") or []
         if not isinstance(params, list):
             raise HHTcpError("bad_tools", f"{where} 'params' must be a list")
+        rollback = entry.get("rollback", False)
+        if not isinstance(rollback, bool):
+            raise HHTcpError("bad_tools", f"{where} 'rollback' must be a boolean")
         declared: list[ToolParam] = []
         for param in params:
             if not isinstance(param, dict):
@@ -1035,7 +1049,13 @@ def parse_local_tools(value: Any) -> list[ToolEntry]:
                 )
             )
         parsed.append(
-            ToolEntry(name=name, description=description, params=declared, hook=None)
+            ToolEntry(
+                name=name,
+                description=description,
+                params=declared,
+                hook=None,
+                remote_rollback=rollback,
+            )
         )
     return parsed
 

@@ -143,6 +143,56 @@ Do not signal failure by raising for control flow; return a string the model can
 act on. Either way the turn continues — a failing tool never aborts a
 conversation.
 
+## Rolling back
+
+Discarding a turn's state delta undoes the state. Anything a tool did *outside*
+the state — installed a package, wrote a file, called an API — needs its own undo,
+so a tool may declare one:
+
+```python
+def install_executor(context: ToolContext, package: str) -> str:
+    run(f"apt install -y {package}")
+    return f"installed {package}"
+
+
+def install_rollback(context: ToolContext, package: str) -> str:
+    # `context.result` is what the call returned, in case the undo needs it
+    run(f"apt remove -y {package}")
+    return f"removed {package}"
+
+
+install_tool = ToolEntry(
+    name="install",
+    description="Install a system package.",
+    params=[ToolParam(name="package", type="string", description="package name")],
+    hook=install_executor,
+    rollback=install_rollback,
+)
+```
+
+When a turn fails, is cancelled, or is abandoned, the rollback of **every call the
+turn made** runs, newest first — so a tool called three times is undone three
+times, each with its own arguments and result. A successful turn rolls back
+nothing.
+
+Rules the harness enforces so your hook can assume them:
+
+- **A failing rollback is contained.** If yours raises, it is reported as
+  `rollback_finished` with `ok: false` and skipped; the other rollbacks still run,
+  and the turn keeps its original failure.
+- **Calls that never reached a tool are not rolled back.** An unknown tool, or
+  arguments that did not bind (a `TypeError` before your hook body ran), did
+  nothing and is not in the list.
+- **The state you see is a copy.** A rollback gets a deep copy of the turn's live
+  state, so nothing it does there can muddy the report of what was discarded —
+  and since a failing turn commits nothing, state edits would have been thrown
+  away anyway.
+- **A cancelled turn does not wait for a client.** For a local tool's undo the
+  request is sent but not waited on, so cancelling stays quick.
+
+Builtin state needs no rollback hook at all: a failing turn commits no deltas, so
+the state is already back where it was.
+
 ## Tools that run on the client
 
 Not every tool belongs on the server. A tool with no `hook` is a **local

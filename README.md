@@ -112,6 +112,11 @@ when one is called the server emits `local_tool_called` and parks that turn unti
 the client answers with `resolve_tool`. The wait holds no lock and no database
 transaction, so the rest of the server keeps working while a client decides.
 
+**And a turn that fails can undo itself.** A tool may declare a `rollback` hook —
+or, if it runs on the client, promise that the client has one — and when a turn
+does not commit, every call it made is offered an undo, newest first. A rollback
+that fails is reported and skipped, so the others still run.
+
 ## Requirements
 
 Python ≥ 3.10 and `requests` (the provider is called through it). SQLite comes

@@ -317,9 +317,13 @@ instead of running:
 
 | Event | Fields |
 |---|---|
-| `local_tool_called` | `round`, `call_id`, `name`, `arguments`, `raw_arguments`, `timeout_ms` — the turn is now parked on this |
-| `local_tool_resolved` | `call_id`, `name`, `ok`, `error`, `result`, `result_chars`, `waited_ms` |
-| `local_tool_unresolved` | `call_id`, `name`, `reason` (`timeout` / `cancelled`), `waited_ms` |
+| `local_tool_called` | `round`, `call_id`, `name`, `kind` (`call`), `arguments`, `raw_arguments`, `timeout_ms` — the turn is now parked on this |
+| `local_tool_rollback` | `call_id` (of the undo), `name`, `kind` (`rollback`), `rollback_of`, `arguments`, `result`, `call_ok`, `timeout_ms` |
+| `local_tool_resolved` | `call_id`, `name`, `kind`, `ok`, `error`, `result`, `result_chars`, `waited_ms` |
+| `local_tool_unresolved` | `call_id`, `name`, `kind`, `reason` (`timeout` / `cancelled`), `waited_ms` |
+
+`kind` distinguishes a call the model asked for from an undo the harness is asking
+for. Answer either with the same `resolve_tool` command.
 
 ### State
 
@@ -345,13 +349,16 @@ the model sees it in the same `tools` array as the builtins.
 ```jsonc
 {"command":"create_agent","id":"root","local_tools":[
   {"name":"ask_operator","description":"Ask the human operator.",
-   "params":[{"name":"question","type":"string","description":"what to ask"}]}
+   "params":[{"name":"question","type":"string","description":"what to ask"}],
+   "rollback": true}
 ]}
 ```
 
 They inherit through `fork` (pass `local_tools` to replace the set), are reported
 as `local_tools` by `agent_created`, `agent_forked` and `list_agents`, and survive
-a restart because the definitions are stored whole.
+a restart because the definitions are stored whole. `"rollback": true` promises
+that the client can undo a call to this tool; without it the server has no reason
+to ask (see below).
 
 When the model calls one, the turn parks and the client is asked:
 
@@ -375,6 +382,40 @@ Things to know:
   server, so such a tool keeps its own memory; forking rewinds builtin state but
   not a client's private memory.
 - **`cancel` releases a parked turn**, reporting `reason: "cancelled"`.
+
+## Rollback
+
+When a turn does not commit — `failed`, `cancelled` or abandoned — every tool call
+it made is offered an undo, **newest call first**. A server-side tool's `rollback`
+hook is called directly; a client-run tool is asked over the protocol, exactly like
+a forward call:
+
+| Event | Fields |
+|---|---|
+| `rollback_started` | `call_id`, `tool`, `index`, `total` |
+| `rollback_finished` | `call_id`, `tool`, `ok`, `error`, `result`, `result_chars`, `elapsed_ms` |
+
+```
+← {"event":"rollback_started","call_id":"call_2","tool":"ask_operator","index":1,"total":2}
+→ {"command":"resolve_tool","id":"a1","call_id":"call_2:rollback","result":"undone"}
+← {"event":"rollback_finished","call_id":"call_2","tool":"ask_operator","ok":true,
+   "error":null,"result":"undone","result_chars":6,"elapsed_ms":3.1}
+```
+
+Rules worth relying on:
+
+- **A failing undo is contained.** It comes back as `rollback_finished` with
+  `ok: false` (and `error` either `rollback_raised`, `bad_arguments`, or whatever
+  the client reported), the rest still run, and the turn's own failure is
+  unaffected. A rollback never turns a failed turn into a different error.
+- **Only calls that reached a tool are undone.** An unknown tool or arguments that
+  never bound did nothing, so they are not in the list. A client-run call that was
+  asked and never answered *is* listed, because the client may have run it.
+- **Undos are not waited on for a cancelled turn.** The request is sent with
+  `timeout_ms: 0`, so `cancel` returns promptly; expect
+  `local_tool_unresolved` with `reason: "cancelled"` for those.
+- **A merely failed turn does wait**, for `local_timeout`, because the caller is
+  still there. Answer promptly or the undo is abandoned and reported.
 
 ## Error codes
 

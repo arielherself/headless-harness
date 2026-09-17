@@ -22,6 +22,10 @@ MAX_TOOL_ROUNDS = 120
 # A hook receiving one event dict per thing that happens during a turn.
 EventHook = Callable[[dict[str, Any]], None]
 
+# Error codes meaning a call never reached the tool body, so nothing happened and
+# there is nothing to undo. A rollback for one of these would be inventing work.
+NOT_RUN = ("bad_arguments", "no_hook")
+
 
 class HHAgentError(RuntimeError):
     """Raised when no completion can be produced: transport, HTTP, or bad payload."""
@@ -88,6 +92,18 @@ class _Pending:
     event: threading.Event
     result: str | None = None
     error: str | None = None
+
+
+@dataclass
+class _Call:
+    """A tool call this turn made, kept so its rollback can undo it."""
+
+    tool: ToolEntry
+    call_id: str
+    arguments: dict[str, Any]
+    raw_arguments: Any
+    result: str
+    ok: bool
 
 
 @dataclass
@@ -196,6 +212,7 @@ class HHAgent:
     _live_states: dict[str, dict[str, Any]]
     _state_bases: dict[str, dict[str, Any]]
     _pending: dict[str, _Pending]
+    _called: list[_Call]
 
     @classmethod
     def root(
@@ -256,6 +273,7 @@ class HHAgent:
         self._state_bases = {}
         self.local_timeout = DEFAULT_LOCAL_TIMEOUT
         self._pending = {}
+        self._called = []
         return self
 
     def fork(
@@ -454,13 +472,40 @@ class HHAgent:
         hook: EventHook | None,
         round_no: int,
     ) -> tuple[str, str | None]:
-        """Announce a client-side tool call, then wait for the answer.
+        """Announce a client-side tool call, then wait for the answer."""
+        return self._ask_client(
+            hook,
+            "local_tool_called",
+            call_id,
+            tool.name,
+            "call",
+            {"round": round_no, "arguments": arguments, "raw_arguments": raw},
+            self.local_timeout,
+            "timeout",
+            stop_on_cancel=True,
+        )
 
-        The wait holds nothing but an event: no registry lock, no database
-        transaction, no store lock. Other connections can create, run, seed and
-        evict blocks the whole time; only this turn's thread is parked.
+    def _ask_client(
+        self,
+        hook: EventHook | None,
+        event: str,
+        call_id: str,
+        name: str,
+        kind: str,
+        fields: dict[str, Any],
+        timeout: float,
+        reason: str,
+        stop_on_cancel: bool,
+    ) -> tuple[str, str | None]:
+        """Announce something the client has to do and wait for its answer.
+
+        The wait holds nothing but an event: no registry lock, no store lock and
+        no open database transaction, so the rest of the server keeps running
+        while a client decides. `reason` labels a give-up when `timeout` is spent,
+        and a cancelled turn only raises when `stop_on_cancel` is set — a rollback
+        must not replace the failure that caused it.
         """
-        pending = _Pending(name=tool.name, event=threading.Event())
+        pending = _Pending(name=name, event=threading.Event())
         self._pending[call_id] = pending
         started = time.monotonic()
         try:
@@ -468,16 +513,14 @@ class HHAgent:
             # immediately is never lost
             self._emit(
                 hook,
-                "local_tool_called",
-                round=round_no,
+                event,
                 call_id=call_id,
-                name=tool.name,
-                arguments=arguments,
-                raw_arguments=raw,
-                id=self.id,
-                timeout_ms=round(self.local_timeout * 1000, 3),
+                name=name,
+                kind=kind,
+                timeout_ms=round(timeout * 1000, 3),
+                **fields,
             )
-            deadline = started + self.local_timeout
+            deadline = started + timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -485,12 +528,15 @@ class HHAgent:
                         hook,
                         "local_tool_unresolved",
                         call_id=call_id,
-                        name=tool.name,
-                        reason="timeout",
+                        name=name,
+                        kind=kind,
+                        reason=reason,
                         waited_ms=self._ms(started),
                     )
-                    late = f"was not answered within {self.local_timeout:g}s"
-                    return (f"Error: local tool '{tool.name}' {late}", "timeout")
+                    return (
+                        f"Error: local tool '{name}' was not answered ({reason})",
+                        reason,
+                    )
                 if pending.event.wait(min(0.2, remaining)):
                     break
                 if self._cancel.is_set():
@@ -498,18 +544,25 @@ class HHAgent:
                         hook,
                         "local_tool_unresolved",
                         call_id=call_id,
-                        name=tool.name,
+                        name=name,
+                        kind=kind,
                         reason="cancelled",
                         waited_ms=self._ms(started),
                     )
-                    raise HHAgentCancelled(
-                        f"agent {self.id} cancelled while waiting for {tool.name}"
+                    if stop_on_cancel:
+                        raise HHAgentCancelled(
+                            f"agent {self.id} cancelled while waiting for {name}"
+                        )
+                    return (
+                        f"Error: local tool '{name}' was not answered (cancelled)",
+                        "cancelled",
                     )
             self._emit(
                 hook,
                 "local_tool_resolved",
                 call_id=call_id,
-                name=tool.name,
+                name=name,
+                kind=kind,
                 ok=pending.error is None,
                 error=pending.error,
                 result=pending.result,
@@ -518,12 +571,101 @@ class HHAgent:
             )
             if pending.error is not None:
                 return (
-                    pending.result or f"Error: local tool '{tool.name}': {pending.error}",
+                    pending.result or f"Error: local tool '{name}': {pending.error}",
                     pending.error,
                 )
             return pending.result or "", None
         finally:
             self._pending.pop(call_id, None)
+
+    def _rollback(self, hook: EventHook | None, outcome: str) -> None:
+        """Undo this turn's tool calls, newest first, because it did not commit.
+
+        Only calls that reached a tool are undone: an unknown tool, or arguments
+        that never bound, did nothing. For a client-run tool that was asked and
+        never answered — timed out or cancelled — the undo is still offered,
+        because the client may have run it before falling silent.
+
+        Every hook is isolated: one that fails is reported and skipped so the rest
+        still run, and a failing rollback can never replace the failure that
+        triggered it. Remote tools are asked over the protocol; a cancelled or
+        abandoned turn is not waited on, so cancelling stays quick.
+        """
+        if not self._called:
+            return
+        calls = list(reversed(self._called))
+        total = len(calls)
+        for index, call in enumerate(calls, start=1):
+            tool = call.tool
+            if not tool.has_rollback:
+                continue
+            self._emit(
+                hook,
+                "rollback_started",
+                call_id=call.call_id,
+                tool=tool.name,
+                index=index,
+                total=total,
+            )
+            started = time.monotonic()
+            if tool.is_local:
+                text, error = self._ask_client(
+                    hook,
+                    "local_tool_rollback",
+                    f"{call.call_id}:rollback",
+                    tool.name,
+                    "rollback",
+                    {
+                        "rollback_of": call.call_id,
+                        "arguments": call.arguments,
+                        "result": call.result,
+                        "call_ok": call.ok,
+                    },
+                    self.local_timeout if outcome == "failed" else 0.0,
+                    "timeout" if outcome == "failed" else outcome,
+                    stop_on_cancel=False,
+                )
+            else:
+                text, error = self._invoke_rollback(tool, call)
+            self._emit(
+                hook,
+                "rollback_finished",
+                call_id=call.call_id,
+                tool=tool.name,
+                ok=error is None,
+                error=error,
+                result=text,
+                result_chars=len(text),
+                elapsed_ms=self._ms(started),
+            )
+
+    def _invoke_rollback(self, tool: ToolEntry, call: _Call) -> tuple[str, str | None]:
+        """Run one server-side rollback hook, containing whatever it throws."""
+        rollback = tool.rollback
+        if rollback is None:
+            return "", None
+        context = ToolContext(
+            tool=tool,
+            agent=self,
+            call_id=call.call_id,
+            arguments=call.arguments,
+            raw_arguments=call.raw_arguments,
+            # a copy, so whatever a rollback does to it cannot muddy the
+            # `state_discarded` report this same turn is about to emit
+            state=copy.deepcopy(self._live_states.get(tool.namespace, {})),
+            result=call.result,
+        )
+        try:
+            return rollback(context, **call.arguments), None
+        except TypeError as exc:
+            return (
+                f"Error: rollback for '{tool.name}' had bad arguments: {exc}",
+                "bad_arguments",
+            )
+        except Exception as exc:
+            # warned and ignored: the remaining rollbacks must still run
+            failure = f"{type(exc).__name__}: {exc}"
+            return (f"Error: rollback for '{tool.name}' raised {failure}", "rollback_raised")
 
     def cancel(self) -> bool:
         """Ask the running turn to stop, returning whether one was running.
@@ -641,7 +783,10 @@ class HHAgent:
             )
             raise
         finally:
+            if outcome != "commit":
+                self._rollback(hook, outcome)
             self._release_states(hook, outcome)
+            self._called.clear()
             self.dirty = False
             self._run_lock.release()
 
@@ -923,9 +1068,15 @@ class HHAgent:
                     )
                 elif tool.is_local:
                     # no hook and no state on this side: the client runs it
+                    # recorded before asking, because a client may run a tool and
+                    # then fail to answer — a cancelled or timed-out call still
+                    # needs its undo offered
+                    call = _Call(tool, call_id, arguments, raw, "", False)
+                    self._called.append(call)
                     text, error = self._answer_local(
                         tool, call_id, arguments, raw, hook, round_no
                     )
+                    call.result, call.ok = text, error is None
                 else:
                     context = ToolContext(
                         tool=tool,
@@ -946,6 +1097,10 @@ class HHAgent:
                         inherited=len(self._state_bases.get(tool.namespace) or {}),
                     )
                     text, error = _run_hook(tool, context)
+                    if error not in NOT_RUN:
+                        self._called.append(
+                            _Call(tool, call_id, arguments, raw, text, error is None)
+                        )
             self._emit(
                 hook,
                 "tool_call_finished",

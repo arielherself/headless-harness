@@ -78,6 +78,7 @@ never dirty.
 | `local_tools` | optional definitions of tools the **client** runs (see below) |
 | `timeout` | optional read timeout in seconds |
 | `local_timeout` | optional seconds to wait for a local tool to be answered (default 120) |
+| `summary_model` | optional model for failure summaries; defaults to the block's own |
 | `include_usage` | optional bool; asks the provider for token accounting |
 | `verbose` | optional bool; additionally emits raw `sse_chunk` events |
 
@@ -98,7 +99,7 @@ endpoint, key, model, tools and options, and **starts dirty**.
 | `id` | **required** — the parent to fork from |
 | `prompt` | **required** — non-empty string |
 | `new_id` | optional id for the new block; supply it to avoid waiting for the reply |
-| `model` `tools` `local_tools` `timeout` `local_timeout` `include_usage` `verbose` | optional overrides for the child only |
+| `model` `tools` `local_tools` `timeout` `local_timeout` `summary_model` `include_usage` `verbose` | optional overrides for the child only |
 
 `tools` and `local_tools` are separate axes: supplying either replaces that half
 and carries the other half over, so a fork can add a local tool without losing
@@ -188,10 +189,12 @@ Errors: `agent_running`, `agent_dirty`, `bad_field`.
 No fields. → `agents_listed` (`count`, `roots`, `dirty` — ids currently dirty,
 `agents` — one entry per block).
 
-Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `error`,
-`prompt_chars`, `prompt_preview`, `text_chars`, `local_len`, `context_len`,
-`model`, `tools`, `local_tools`, `state_namespaces`, `waiting_on` (local calls
-this block is parked on), `include_usage`, `verbose`, `created_at`, `age_ms`.
+Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `outcome`
+(`ok` / `failed` / `cancelled` / `abandoned`, null before the turn has run),
+`error`, `prompt_chars`, `prompt_preview`, `text_chars`, `local_len`,
+`context_len`, `model`, `summary_model`, `tools`, `local_tools`,
+`state_namespaces`, `waiting_on` (local calls this block is parked on),
+`include_usage`, `verbose`, `created_at`, `age_ms`.
 
 ### `destroy_agent`
 
@@ -350,7 +353,7 @@ the model sees it in the same `tools` array as the builtins.
 {"command":"create_agent","id":"root","local_tools":[
   {"name":"ask_operator","description":"Ask the human operator.",
    "params":[{"name":"question","type":"string","description":"what to ask"}],
-   "rollback": true}
+   "rollback": true, "external_effects": true}
 ]}
 ```
 
@@ -358,7 +361,9 @@ They inherit through `fork` (pass `local_tools` to replace the set), are reporte
 as `local_tools` by `agent_created`, `agent_forked` and `list_agents`, and survive
 a restart because the definitions are stored whole. `"rollback": true` promises
 that the client can undo a call to this tool; without it the server has no reason
-to ask (see below).
+to ask (see below). `"external_effects": true` declares that calls to this tool
+reach beyond the state, which is what lets a failure note warn that such effects
+may still stand when there is no undo for them.
 
 When the model calls one, the turn parks and the client is asked:
 
@@ -393,7 +398,11 @@ a forward call:
 | Event | Fields |
 |---|---|
 | `rollback_started` | `call_id`, `tool`, `index`, `total` |
+| `rollback_unavailable` | `call_id`, `tool`, `index`, `total` — no undo exists and the tool declared effects, so they may still stand |
 | `rollback_finished` | `call_id`, `tool`, `ok`, `error`, `result`, `result_chars`, `elapsed_ms` |
+| `failure_summary_started` | `model`, `error`, `outcome`, `messages`, `request_bytes`, `timeout` |
+| `failure_summary_finished` | `status`, `summary`, `chars`, `chunks`, `finish_reason`, `usage`, `elapsed_ms` |
+| `failure_summary_failed` | `error`, `error_type`, `elapsed_ms` (plus `status` on an HTTP refusal, `chunks` if it broke mid-stream) |
 
 ```
 ← {"event":"rollback_started","call_id":"call_2","tool":"ask_operator","index":1,"total":2}
@@ -416,6 +425,57 @@ Rules worth relying on:
   `local_tool_unresolved` with `reason: "cancelled"` for those.
 - **A merely failed turn does wait**, for `local_timeout`, because the caller is
   still there. Answer promptly or the undo is abandoned and reported.
+
+## Failed turns leave a note
+
+A turn that does not commit rolls back and then appends **one ordinary message**
+to its block, so a block forked from it carries the truth in its context: the
+transcript above may still describe tool effects that the rollback has undone.
+
+```
+← {"event":"history_appended","source":"failure","role":"user",
+   "preview":"[harness] the previous turn failed; the state it changed was discarded.…"}
+```
+
+The message is `user`-role and prefixed `[harness]`, and looks like:
+
+```
+[harness] the previous turn failed; the state it changed was discarded.
+Undone: get_current_time.
+Could not be undone: terminal.
+May still be in effect: sendmail.
+Reported error: HHAgentError: stream from … failed: Connection broken
+In short: <what the turn was doing and where it stood>
+```
+
+The three lists are the whole truth about the environment, and they partition the
+calls that declared `external_effects`:
+
+| Line | Means |
+|---|---|
+| `Undone:` | the tool had an undo and it ran |
+| `Could not be undone:` | the tool had an undo and it failed |
+| `May still be in effect:` | the tool declared effects but has no undo at all |
+
+A tool that declares nothing is not mentioned: its state was still rolled back
+with the rest of the turn, and it claimed no effects outside it. So a tool with
+real-world effects should declare `external_effects` — builtin as a field,
+client-run in its definition — or the note will quietly leave them out.
+
+- **A `failed` turn is summarised** by a model — one request, no tools, sent to
+  `summary_model` or the block's own model. `failure_summary_started` /
+  `_finished` / `_failed` report it. If that request fails, the summary is
+  dropped and the note keeps the raw error, which is always included verbatim.
+- **A `cancelled` or abandoned turn uses fixed text** and makes no request, so
+  cancelling stays prompt and teardown does no network I/O.
+- **A turn with no tool call and no text is not summarised**: the error is the
+  whole story.
+- **The partial answer is not part of the note.** It is kept as the block's `text`
+  and fed to the summariser, but not added to `messages`: a truncated fragment
+  read as a finished reply misleads.
+- **`outcome` on the block** says which of `ok` / `failed` / `cancelled` /
+  `abandoned` it was, and is persisted, so this does not have to be inferred from
+  the error string.
 
 ## Error codes
 

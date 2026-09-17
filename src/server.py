@@ -39,13 +39,21 @@ Events
     tool_call_started, tool_call_finished, state_loaded, state_delta,
     state_discarded, local_tool_called, local_tool_rollback,
     local_tool_resolved, local_tool_unresolved, rollback_started,
-    rollback_finished
+    rollback_finished, rollback_unavailable, failure_summary_started,
+    failure_summary_finished, failure_summary_failed
 
 When a turn does not commit — it failed, was cancelled, or was abandoned — every
 tool it called is offered a rollback, newest call first, so effects outside the
 state can be undone. A rollback that fails is reported and skipped; the rest
 still run. Client-run tools are asked over the protocol like any other local
 call.
+
+A turn that ends without committing also leaves a note in its block, because the
+transcript above it may still describe tool effects the rollback has undone: a
+failed turn's note is summarised by the model (`failure_summary_*` events) and
+always carries the raw error, while a cancelled or abandoned one uses fixed text.
+The note is an ordinary message, so a block forked from that block carries it
+along.
 
 A block may also carry `local_tools`: tools the *client* runs. They are offered
 to the model with everything else, and when one is called the server emits
@@ -106,9 +114,12 @@ COMMANDS: list[dict[str, Any]] = [
             "model": "optional, falls back to the server default",
             "tools": "optional list of names, defaults to every builtin",
             "local_tools": "optional list of tool definitions the client runs; "
-            "each may set \"rollback\": true to be asked to undo a failed turn",
+            "each may set \"rollback\": true to be asked to undo a failed turn, "
+            "and \"external_effects\": true to be named in the failure note when "
+            "no undo is available",
             "timeout": "optional read timeout in seconds",
             "local_timeout": "optional seconds to wait for a local tool answer",
+            "summary_model": "optional model for failure summaries; defaults to the block's own",
             "include_usage": "optional bool, ask for token accounting",
             "verbose": "optional bool, also emit raw sse_chunk events",
         },
@@ -125,6 +136,7 @@ COMMANDS: list[dict[str, Any]] = [
             "local_tools": "optional override, replaces the inherited definitions",
             "timeout": "optional override inherited from the parent",
             "local_timeout": "optional override inherited from the parent",
+            "summary_model": "optional override inherited from the parent",
             "include_usage": "optional override inherited from the parent",
             "verbose": "optional override inherited from the parent",
         },
@@ -187,7 +199,9 @@ COMMANDS: list[dict[str, Any]] = [
 ]
 
 # Settings a fork may override on the block it creates.
-INHERITED = ("model", "timeout", "local_timeout", "include_usage", "verbose")
+INHERITED = (
+    "model", "timeout", "local_timeout", "summary_model", "include_usage", "verbose"
+)
 BOOL_FIELDS = ("include_usage", "verbose")
 FLOAT_FIELDS = ("timeout", "local_timeout")
 
@@ -455,6 +469,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             local_timeout=as_timeout(
                 command.get("local_timeout") or DEFAULT_LOCAL_TIMEOUT, "local_timeout"
             ),
+            summary_model=command.get("summary_model") or "",
             include_usage=bool(command.get("include_usage", True)),
             verbose=bool(command.get("verbose", False)),
             id=agent_id,
@@ -477,6 +492,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             model=block.model,
             endpoint=block.endpoint,
             timeout=block.timeout,
+            summary_model=block.summary_model,
             include_usage=block.include_usage,
             verbose=block.verbose,
             tools=sorted(block.tools),
@@ -903,6 +919,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             "depth": block.depth,
             "dirty": block.dirty,
             "running": block.running,
+            "outcome": block.outcome,
             "error": block.error,
             "prompt_chars": len(block.prompt),
             "prompt_preview": block.prompt[:200],
@@ -910,6 +927,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             "local_len": len(block.messages),
             "context_len": len(block.context()),
             "model": block.model,
+            "summary_model": block.summary_model,
             "tools": sorted(block.tools),
             "state_namespaces": block.state_namespaces(),
             "local_tools": sorted(
@@ -1032,6 +1050,11 @@ def parse_local_tools(value: Any) -> list[ToolEntry]:
         rollback = entry.get("rollback", False)
         if not isinstance(rollback, bool):
             raise HHTcpError("bad_tools", f"{where} 'rollback' must be a boolean")
+        effects = entry.get("external_effects", False)
+        if not isinstance(effects, bool):
+            raise HHTcpError(
+                "bad_tools", f"{where} 'external_effects' must be a boolean"
+            )
         declared: list[ToolParam] = []
         for param in params:
             if not isinstance(param, dict):
@@ -1055,6 +1078,7 @@ def parse_local_tools(value: Any) -> list[ToolEntry]:
                 params=declared,
                 hook=None,
                 remote_rollback=rollback,
+                external_effects=effects,
             )
         )
     return parsed
@@ -1087,6 +1111,8 @@ def tool_catalogue() -> list[dict[str, Any]]:
             "name": tool.name,
             "description": tool.description,
             "state_namespace": tool.namespace,
+            "external_effects": tool.external_effects,
+            "rollback": tool.has_rollback,
             "params": [
                 {
                     "name": param.name,

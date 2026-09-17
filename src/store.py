@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     state_deltas  BLOB NOT NULL,
     text          TEXT NOT NULL,
     error         TEXT,
+    outcome       TEXT,
     dirty         INTEGER NOT NULL,
     created_at    REAL NOT NULL,
     endpoint      TEXT NOT NULL,
@@ -56,22 +57,32 @@ CREATE TABLE IF NOT EXISTS blocks (
     include_usage INTEGER NOT NULL,
     verbose       INTEGER NOT NULL,
     tool_names    TEXT NOT NULL,
-    local_tools   TEXT NOT NULL DEFAULT '[]'
+    local_tools   TEXT NOT NULL DEFAULT '[]',
+    summary_model TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS blocks_parent ON blocks (parent_id);
 CREATE INDEX IF NOT EXISTS blocks_created ON blocks (created_at);
 """
 
 COLUMNS = (
-    "id, parent_id, prompt, messages, state_deltas, text, error, dirty, "
-    "created_at, endpoint, model, timeout, include_usage, verbose, tool_names, "
-    "local_tools"
+    "id, parent_id, prompt, messages, state_deltas, text, error, outcome, dirty, "
+    "created_at, endpoint, model, timeout, summary_model, include_usage, verbose, "
+    "tool_names, local_tools"
 )
 
 # Columns refreshed when a block that already has a row changes.
 UPDATABLE = (
-    "prompt, messages, state_deltas, text, error, dirty, created_at, endpoint, "
-    "model, timeout, include_usage, verbose, tool_names, local_tools"
+    "prompt, messages, state_deltas, text, error, outcome, dirty, created_at, "
+    "endpoint, model, timeout, summary_model, include_usage, verbose, tool_names, "
+    "local_tools"
+)
+
+# Columns added after the first release. SQLite has no `ADD COLUMN IF NOT
+# EXISTS`, so `_migrate` walks this list against the table's own column list.
+ADDED_COLUMNS = (
+    ("local_tools", "TEXT NOT NULL DEFAULT '[]'"),
+    ("outcome", "TEXT"),
+    ("summary_model", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # A subtree that may be reclaimed: a root, or a block whose parent has forks.
@@ -139,10 +150,9 @@ class HHStore:
         need a real migration step.
         """
         columns = {row["name"] for row in self._db.execute("PRAGMA table_info(blocks)")}
-        if "local_tools" not in columns:
-            self._db.execute(
-                "ALTER TABLE blocks ADD COLUMN local_tools TEXT NOT NULL DEFAULT '[]'"
-            )
+        for name, ddl in ADDED_COLUMNS:
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE blocks ADD COLUMN {name} {ddl}")
 
     def _claim_file(self) -> Any:
         if fcntl is None:
@@ -181,11 +191,13 @@ class HHStore:
             blob,
             block.text,
             block.error,
+            block.outcome,
             int(block.dirty),
             block.created_at,
             block.endpoint,
             block.model,
             float(block.timeout),
+            block.summary_model,
             int(block.include_usage),
             int(block.verbose),
             json.dumps(sorted(t.name for t in block.tools.values() if not t.is_local)),
@@ -237,6 +249,7 @@ class HHStore:
                 model=row["model"],
                 tools=[self.tools[name] for name in names if name in self.tools] + local,
                 timeout=row["timeout"],
+                summary_model=row["summary_model"],
                 include_usage=bool(row["include_usage"]),
                 verbose=bool(row["verbose"]),
                 id=row["id"],
@@ -253,6 +266,7 @@ class HHStore:
             block.prompt = row["prompt"]
             block.text = row["text"]
             block.error = row["error"]
+            block.outcome = row["outcome"]
             block.dirty = bool(row["dirty"])
             block.created_at = row["created_at"]
             blocks[row["id"]] = block
@@ -322,6 +336,7 @@ class HHStore:
                     for p in tool.params
                 ],
                 "rollback": tool.remote_rollback,
+                "external_effects": tool.external_effects,
             }
             for tool in block.tools.values()
             if tool.is_local
@@ -341,6 +356,7 @@ class HHStore:
             ],
             hook=None,
             remote_rollback=bool(entry.get("rollback")),
+            external_effects=bool(entry.get("external_effects")),
         )
 
     # --- encoding --------------------------------------------------------

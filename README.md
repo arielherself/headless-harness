@@ -117,6 +117,12 @@ or, if it runs on the client, promise that the client has one — and when a tur
 does not commit, every call it made is offered an undo, newest first. A rollback
 that fails is reported and skipped, so the others still run.
 
+**A failed block explains itself.** Because the transcript above it may describe
+effects the rollback has undone, such a block gains one `[harness]` note saying
+what failed and what was undone — summarised by a model from the turn's own
+messages, and always carrying the raw error. Forking from a failed block then
+hands the next model the truth rather than a stale narrative.
+
 ## Requirements
 
 Python ≥ 3.10 and `requests` (the provider is called through it). SQLite comes

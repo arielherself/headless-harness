@@ -93,10 +93,64 @@ Two rules make rollback safe to rely on:
   that never bound, did nothing and is left out — undoing it would be inventing
   work. A client-run call that was asked and never answered *is* included, because
   the client may have run it before going quiet.
+- **Declared effects with no undo are named, not omitted.** A rollback hook can
+  only exist for effects the author knows how to take back, so the note would
+  otherwise be silent about the rest — and its opening line, "the state it changed
+  was discarded", invites reading that as "the environment is as it was". A tool
+  therefore declares `external_effects`, and the calls that declared it are
+  partitioned into undone, undo failed, and *may still be in effect*. Silence is
+  reserved for tools that claimed nothing, which is the honest reading.
 
 A cancelled or abandoned turn asks for its undos without waiting: the request goes
 out, no reply is waited on, and `cancel` stays responsive. A merely failed turn
 waits, because the caller is still there.
+
+### Leaving a note behind
+
+Rollback restores the environment, which makes a failed block an *attractive*
+place to fork from — and that is exactly what makes a note necessary. The
+transcript above it still says `tool: installed python3-requests` while the
+environment no longer has it, so a child that forks from a failed block would
+trust a narrative that has stopped being true.
+
+So a turn that does not commit appends one ordinary message to its block:
+
+```
+[harness] the previous turn failed; the state it changed was discarded.
+Undone: get_current_time.
+Could not be undone: terminal.
+Reported error: HHAgentError: stream from … failed: Connection broken
+In short: 这一轮的目标是安装 …；安装已生效且无法回滚，取时间的调用被撤销。
+```
+
+Design points behind that shape:
+
+- **An ordinary message, not a side channel.** It is a plain `user` message, so
+  it flows into every descendant's context through `context()` with no special
+  casing, and `history_appended` reports it like any other (`source: "failure"`).
+  The `[harness]` prefix is what marks it as the harness talking: mid-conversation
+  `system` messages are refused by some OpenAI-compatible backends, while
+  consecutive `user` messages are accepted (verified).
+- **The raw error is kept verbatim.** The summary is written by a model and can
+  distort the cause; the error is the part that is certainly true.
+- **The summary is written by a model, one request, no tools.** It sees the
+  turn's own transcript, the error, and what the rollback managed to undo. A
+  `summary_model` can point it at something cheaper or more reliable than the
+  model that just failed. If that request fails too, the note falls back to the
+  raw error — which is why the error is in the note regardless.
+- **The note is written before `dirty` clears**, so forking from the block can
+  never miss it. That is also why a failure costs one extra request before it is
+  reported.
+- **Only a failed turn is summarised.** A cancelled turn gets fixed text: putting
+  an LLM call in the way of the stop the caller just asked for would undo the
+  point of cancelling. An abandoned generator gets fixed text too — it must not
+  start network calls during teardown at all.
+- **A turn with nothing to summarise is not summarised.** If it called no tool and
+  produced no text, the error *is* the whole story.
+
+The partial answer, if the model had started writing, is kept on the block as
+`text` but deliberately **not** added to `messages`: a truncated fragment read as
+a finished reply misleads. It goes into the summary instead.
 
 ## 4. Tool state: deltas, namespaces, and deep copies
 

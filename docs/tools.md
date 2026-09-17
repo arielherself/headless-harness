@@ -167,8 +167,25 @@ install_tool = ToolEntry(
     params=[ToolParam(name="package", type="string", description="package name")],
     hook=install_executor,
     rollback=install_rollback,
+    external_effects=True,      # it really does install things
 )
 ```
+
+**`external_effects` is a separate declaration from `rollback`, and both are
+needed for the note to be honest.** State rolls back on its own, so the harness
+has no way to know whether a tool touched anything else; `external_effects` is how
+you tell it. A failure note then partitions the calls that declared it into
+`Undone`, `Could not be undone`, and — for a tool that declared effects but has no
+undo — `May still be in effect`. A tool that declares nothing is simply not
+mentioned, so:
+
+- Declare `external_effects` on anything that reaches outside the state, **even if
+  it cannot be undone.** "I sent an email and there is no taking it back" is a
+  legitimate pair of declarations, and the note should say so rather than stay
+  silent.
+- Forgetting it is the failure mode to watch for: a tool that moved the world
+  without declaring it leaves the next model assuming a clean environment. The
+  harness cannot detect this for you.
 
 When a turn fails, is cancelled, or is abandoned, the rollback of **every call the
 turn made** runs, newest first — so a tool called three times is undone three
@@ -192,6 +209,14 @@ Rules the harness enforces so your hook can assume them:
 
 Builtin state needs no rollback hook at all: a failing turn commits no deltas, so
 the state is already back where it was.
+
+After the rollbacks, the turn appends one `[harness]` message to its block saying
+what failed and what was undone — summarised by a model from the turn's own
+messages, with the raw error kept verbatim (see
+[`protocol.md`](protocol.md#failed-turns-leave-a-note)). You get that for free;
+the only thing worth knowing as a tool author is that a rollback failing is
+reported there as `Could not be undone`, which is the cue for whoever reads the
+chain next that an effect is still standing.
 
 ## Tools that run on the client
 

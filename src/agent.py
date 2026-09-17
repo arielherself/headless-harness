@@ -26,6 +26,18 @@ EventHook = Callable[[dict[str, Any]], None]
 # there is nothing to undo. A rollback for one of these would be inventing work.
 NOT_RUN = ("bad_arguments", "no_hook")
 
+# Asked of the model when a turn fails, to leave a note for whoever reads the
+# chain next. One request, no tools: it only writes the note.
+SUMMARY_PROMPT = (
+    "You are the harness that runs a conversation agent, and one turn of that "
+    "conversation has just failed. Write a short note, for the model that will "
+    "read this conversation next, describing what the turn tried to do and where "
+    "it stood when it stopped. Summarise simply, in the language the conversation "
+    "is in. Do not repeat the transcript or the error verbatim — the reader has "
+    "both already — and do not ask questions, offer help, or go beyond what the "
+    "transcript shows."
+)
+
 
 class HHAgentError(RuntimeError):
     """Raised when no completion can be produced: transport, HTTP, or bad payload."""
@@ -104,6 +116,15 @@ class _Call:
     raw_arguments: Any
     result: str
     ok: bool
+
+
+@dataclass
+class _Undo:
+    """What became of one call's effects when the turn did not commit."""
+
+    tool: str
+    status: str  # "undone", "stuck" (the undo failed), or "standing"
+    error: str | None = None
 
 
 @dataclass
@@ -194,6 +215,8 @@ class HHAgent:
     messages: list[dict[str, Any]]
     text: str
     error: str | None
+    # how the turn ended: "ok", "failed", "cancelled" or "abandoned"
+    outcome: str | None
     dirty: bool
     created_at: float
     endpoint: str
@@ -202,6 +225,8 @@ class HHAgent:
     tools: dict[str, ToolEntry]
     timeout: float
     local_timeout: float
+    # model for failure summaries; empty means this block's own model
+    summary_model: str
     include_usage: bool
     verbose: bool
     on_event: EventHook | None
@@ -223,6 +248,7 @@ class HHAgent:
         tools: Iterable[ToolEntry] = builtin_tools,
         timeout: float = DEFAULT_TIMEOUT,
         local_timeout: float = DEFAULT_LOCAL_TIMEOUT,
+        summary_model: str = "",
         include_usage: bool = True,
         verbose: bool = False,
         on_event: EventHook | None = None,
@@ -248,6 +274,7 @@ class HHAgent:
         self.tools = {tool.name: tool for tool in tools}
         self.timeout = timeout
         self.local_timeout = local_timeout
+        self.summary_model = summary_model
         self.include_usage = include_usage
         self.verbose = verbose
         self.on_event = on_event
@@ -263,6 +290,7 @@ class HHAgent:
         self.messages = []
         self.text = ""
         self.error = None
+        self.outcome = None
         self.dirty = False
         self.created_at = time.time()
         self.on_event = None
@@ -306,6 +334,7 @@ class HHAgent:
         child.tools = dict(self.tools)
         child.timeout = self.timeout
         child.local_timeout = self.local_timeout
+        child.summary_model = self.summary_model
         child.include_usage = self.include_usage
         child.verbose = self.verbose
         child.on_event = self.on_event if on_event is None else on_event
@@ -578,7 +607,7 @@ class HHAgent:
         finally:
             self._pending.pop(call_id, None)
 
-    def _rollback(self, hook: EventHook | None, outcome: str) -> None:
+    def _rollback(self, hook: EventHook | None, outcome: str) -> list[_Undo]:
         """Undo this turn's tool calls, newest first, because it did not commit.
 
         Only calls that reached a tool are undone: an unknown tool, or arguments
@@ -590,14 +619,31 @@ class HHAgent:
         still run, and a failing rollback can never replace the failure that
         triggered it. Remote tools are asked over the protocol; a cancelled or
         abandoned turn is not waited on, so cancelling stays quick.
+
+        Returns one `_Undo` per call whose effects needed attention, newest
+        first, for the failure note to report: undone, undo failed, or nothing to
+        run because the tool declared effects it cannot take back.
         """
+        report: list[_Undo] = []
         if not self._called:
-            return
+            return report
         calls = list(reversed(self._called))
         total = len(calls)
         for index, call in enumerate(calls, start=1):
             tool = call.tool
             if not tool.has_rollback:
+                if tool.external_effects:
+                    # nothing to run, but the world moved; only the author knows
+                    # whether anything can put it back
+                    self._emit(
+                        hook,
+                        "rollback_unavailable",
+                        call_id=call.call_id,
+                        tool=tool.name,
+                        index=index,
+                        total=total,
+                    )
+                    report.append(_Undo(tool.name, "standing"))
                 continue
             self._emit(
                 hook,
@@ -638,6 +684,218 @@ class HHAgent:
                 result_chars=len(text),
                 elapsed_ms=self._ms(started),
             )
+            report.append(
+                _Undo(tool.name, "undone" if error is None else "stuck", error)
+            )
+        return report
+
+    def _record_failure(
+        self,
+        hook: EventHook | None,
+        outcome: str,
+        rolled_back: list[_Undo],
+    ) -> None:
+        """Leave a note in the block saying why it ended and what was undone.
+
+        The note is an ordinary message, so a block forked from this one carries
+        it into its context — which is the point: the transcript above it may
+        still describe tool effects the rollback has since undone, and the next
+        model should not trust that blindly.
+
+        Only a failed turn is summarised by the model. A cancelled or abandoned
+        one gets a fixed note: summarising would put an extra request in the way
+        of the stop the caller just asked for, and an abandoned generator must
+        not start network calls during teardown at all.
+        """
+        summary = None
+        if outcome == "failed" and self._worth_summarizing():
+            summary = self._summarize_failure(hook, rolled_back)
+        note = self._failure_note(outcome, summary, rolled_back)
+        self._remember(hook, {"role": "user", "content": note}, "failure")
+
+    def _worth_summarizing(self) -> bool:
+        """Whether a summary would say more than the raw error already does.
+
+        A turn that called nothing and produced no text is fully described by the
+        error, so summarising it would be a wasted request.
+        """
+        return bool(self._called or self.text)
+
+    def _failure_note(
+        self,
+        outcome: str,
+        summary: str | None,
+        rolled_back: list[_Undo],
+    ) -> str:
+        """The text left behind: bracketed, so it reads as a harness note."""
+        head = {
+            "cancelled": "the previous turn was cancelled by the caller",
+            "abandoned": "the previous turn was abandoned before it finished",
+        }.get(outcome, "the previous turn failed")
+        parts = [f"[harness] {head}; the state it changed was discarded."]
+        undone = [u.tool for u in rolled_back if u.status == "undone"]
+        stuck = [u.tool for u in rolled_back if u.status == "stuck"]
+        standing = [u.tool for u in rolled_back if u.status == "standing"]
+        if undone:
+            parts.append(f"Undone: {', '.join(undone)}.")
+        if stuck:
+            parts.append(f"Could not be undone: {', '.join(stuck)}.")
+        if standing:
+            # declared effects with nothing to take them back
+            parts.append(f"May still be in effect: {', '.join(standing)}.")
+        if self.error:
+            # kept verbatim: the summary is written by a model and may distort it
+            parts.append(f"Reported error: {self.error}")
+        if summary:
+            parts.append(f"In short: {summary}")
+        elif outcome == "failed":
+            parts.append("No summary was available.")
+        return "\n".join(parts)
+
+    def _summary_prompt(
+        self, rolled_back: list[_Undo]
+    ) -> str:
+        """The transcript of this turn, for the summariser to read."""
+        lines = ["The turn that failed, as it was recorded:", ""]
+        for message in self.messages:
+            content = (message.get("content") or "")[:4000]
+            if message.get("tool_calls"):
+                calls = "; ".join(
+                    f"{call['function']['name']}({call['function']['arguments']})"
+                    for call in message["tool_calls"]
+                )
+                content = f"{content} [tool calls: {calls}]".strip()
+            lines.append(f"{message.get('role')}: {content}")
+        if self.text:
+            lines += ["", f"assistant, cut off mid-answer: {self.text[:4000]}"]
+        lines += [
+            "",
+            f"The turn ended as: {self.outcome}",
+            f"The reported error: {self.error}",
+        ]
+        undone = [u.tool for u in rolled_back if u.status == "undone"]
+        stuck = [u.tool for u in rolled_back if u.status == "stuck"]
+        standing = [u.tool for u in rolled_back if u.status == "standing"]
+        if undone:
+            lines.append(f"Effects that were undone: {', '.join(undone)}")
+        if stuck:
+            lines.append(f"Effects that could NOT be undone: {', '.join(stuck)}")
+        if standing:
+            lines.append(
+                "Effects with no undo available, which may still be in effect: "
+                + ", ".join(standing)
+            )
+        return "\n".join(lines)
+
+    def _summarize_failure(
+        self, hook: EventHook | None, rolled_back: list[_Undo]
+    ) -> str | None:
+        """Ask the model to write the note. Returns None if that fails too.
+
+        Deliberately a plain request with no tools: the summariser cannot call
+        anything, it only writes. A failure here is reported and then ignored —
+        the note falls back to the raw error, which is the part that matters.
+        """
+        model = self.summary_model or self.model
+        url = f"{self.endpoint}/v1/chat/completions"
+        body = json.dumps(
+            {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SUMMARY_PROMPT},
+                    {"role": "user", "content": self._summary_prompt(rolled_back)},
+                ],
+                "stream": True,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self._emit(
+            hook,
+            "failure_summary_started",
+            model=model,
+            error=self.error,
+            outcome=self.outcome,
+            messages=len(self.messages),
+            request_bytes=len(body),
+            timeout=self.timeout,
+        )
+        started = time.monotonic()
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.key}",
+                    "Content-Type": "application/json",
+                },
+                data=body,
+                stream=True,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            self._emit(
+                hook,
+                "failure_summary_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                elapsed_ms=self._ms(started),
+            )
+            return None
+        with response:
+            response.encoding = "utf-8"
+            if not response.ok:
+                self._emit(
+                    hook,
+                    "failure_summary_failed",
+                    status=response.status_code,
+                    error=response.text[:500],
+                    error_type="HTTPError",
+                    elapsed_ms=self._ms(started),
+                )
+                return None
+            parts: list[str] = []
+            chunks, usage, finish = 0, None, None
+            try:
+                for line in self._sse_payloads(response):
+                    if line == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunks += 1
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    if choices[0].get("finish_reason"):
+                        finish = choices[0]["finish_reason"]
+                    text = (choices[0].get("delta") or {}).get("content") or ""
+                    if text:
+                        parts.append(text)
+            except requests.RequestException as exc:
+                self._emit(
+                    hook,
+                    "failure_summary_failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    chunks=chunks,
+                    elapsed_ms=self._ms(started),
+                )
+                return None
+        summary = "".join(parts).strip()
+        self._emit(
+            hook,
+            "failure_summary_finished",
+            status=response.status_code,
+            summary=summary,
+            chars=len(summary),
+            chunks=chunks,
+            finish_reason=finish,
+            usage=usage,
+            elapsed_ms=self._ms(started),
+        )
+        return summary or None
 
     def _invoke_rollback(self, tool: ToolEntry, call: _Call) -> tuple[str, str | None]:
         """Run one server-side rollback hook, containing whatever it throws."""
@@ -725,8 +983,13 @@ class HHAgent:
             self._announce(hook, self.messages[0], "fork")
             for round_no in range(1, MAX_TOOL_ROUNDS + 1):
                 turn = _Turn()
-                yield from self._stream_turn(turn, hook, round_no)
-                parts.append(turn.content)
+                try:
+                    yield from self._stream_turn(turn, hook, round_no)
+                finally:
+                    # captured even when the round fails mid-stream, so a failed
+                    # turn still reports what the model had said so far
+                    if turn.content:
+                        parts.append(turn.content)
                 reply = turn.message()
                 self._remember(hook, reply, "assistant")
                 calls = reply.get("tool_calls")
@@ -783,9 +1046,17 @@ class HHAgent:
             )
             raise
         finally:
-            if outcome != "commit":
-                self._rollback(hook, outcome)
+            rolled_back = (
+                self._rollback(hook, outcome) if outcome != "commit" else []
+            )
             self._release_states(hook, outcome)
+            self.outcome = "ok" if outcome == "commit" else outcome
+            if outcome != "commit":
+                # recorded after the rollback, so the note can say what was
+                # undone, and before `dirty` clears, so a fork from this block
+                # can never miss it
+                self.text = "".join(parts)
+                self._record_failure(hook, outcome, rolled_back)
             self._called.clear()
             self.dirty = False
             self._run_lock.release()

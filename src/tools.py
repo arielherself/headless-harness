@@ -38,6 +38,12 @@ class ToolEntry:
     # says instead that the client has one to ask for
     rollback: Callable[..., str] | None = None
     remote_rollback: bool = False
+    # Declares that calls to this tool reach beyond the state: they installed
+    # something, wrote a file, sent a request. State rolls back on its own, so
+    # this is what lets a failure note warn that such effects may still stand.
+    # It says nothing about whether an undo exists — an irreversible effect is a
+    # legitimate declaration, not a mistake to be flagged.
+    external_effects: bool = False
 
     @property
     def is_local(self) -> bool:

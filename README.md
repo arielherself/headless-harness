@@ -66,6 +66,23 @@ The bundled client has its own flags: `--host`, `--port`, `--agent ID` (resume a
 an existing block), `--db` (forwarded when it spawns a server), `--no-spawn`,
 `--think`, `--raw`, `--no-color`.
 
+## Tests
+
+The suite runs offline: a scripted fake provider stands in for the model API and
+speaks real HTTP + SSE, and every server test drives a real `HHServer` on an
+ephemeral port against a temporary SQLite file. No key, no network, no state left
+behind in `harness.db`.
+
+```bash
+python -m unittest discover -s tests -t . -v
+```
+
+`tests/support.py` holds the shared pieces — the scripted provider, the JSONL
+client, and the in-process server fixture. `tests/test_agent.py` covers the block
+chain, turns, tools, state and rollback; `tests/test_server.py` covers the wire
+protocol, the registry, persistence and eviction; `tests/test_store.py` and
+`tests/test_tools.py` cover the store and the tool schema.
+
 ## Documentation
 
 | Document | What it covers |
@@ -84,6 +101,7 @@ src/store.py    HHStore  — SQLite mirror, size budget, subtree eviction
 src/tools.py    ToolEntry / ToolContext and the builtin tools
 src/main.py     empty placeholder
 test.py         interactive client (gitignored: it holds the API key)
+tests/          the test-suite (see Tests above)
 docs/           this documentation
 ```
 

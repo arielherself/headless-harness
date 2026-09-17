@@ -29,11 +29,36 @@ add_tool = ToolEntry(
 | `name` | what the model calls; also the default state namespace |
 | `description` | shown to the model — this is prompt text, so write it well |
 | `params` | `ToolParam(name, type, description)`; every one is sent as `required` |
-| `hook` | `hook(context, **arguments) -> str` |
+| `hook` | `hook(context, **arguments) -> str`, or a `ToolResult` when it returns images |
 | `state_namespace` | where the tool's state lives; empty means its own name (see below) |
 
 The hook is always called with the context first and the model's arguments as
 keywords, so a tool with no parameters is `def hook(context: ToolContext) -> str`.
+
+### Returning images
+
+A hook may return a plain string, as above, or a `ToolResult` when the model
+should see images too:
+
+```python
+import base64
+
+from tools import ToolResult
+
+
+def screenshot_executor(context: ToolContext, url: str) -> ToolResult:
+    png = take_screenshot(url)  # bytes, whatever your tool produces
+    encoded = base64.b64encode(png).decode("ascii")
+    return ToolResult(f"Captured {url}", images=[f"data:image/png;base64,{encoded}"])
+```
+
+`images` takes the same shapes `fork` accepts:
+[`protocol.md#images`](protocol.md#images) — an `http(s)` URL or
+`data:image/...` URI string, or a `{url, detail}` mapping. The text is what
+events, failure summaries and rollback reports carry; the image bytes only ever
+go into the model's tool message. A malformed `ToolResult` (a bad image, a local
+path, non-string text) comes back to the model as a `bad_result` error and the
+turn continues.
 
 Register it by adding it to `builtin_tools` at the bottom of `tools.py`. Clients
 then choose which tools a block gets:
@@ -111,9 +136,9 @@ its turn. Do not put sockets, locks, or generators in state.
 value of `packages` for that block. Bury everything under one key and every block
 stores that whole value; keep state flat.
 
-**State is invisible to the model.** The model only sees the string your hook
-returns. If it should know something happened, say so in the result — state will
-not tell it.
+**State is invisible to the model.** The model only sees your hook's result —
+its text, plus any images. If it should know something happened, say so in the
+result — state will not tell it.
 
 **A failed turn discards state.** If the turn errors, is cancelled, or the caller
 walks away from the stream, no delta is committed, and `state_discarded` reports
@@ -138,6 +163,7 @@ an `error` code.
 | `unknown_tool` | the model called a name that is not registered |
 | `bad_arguments` | the arguments were not a JSON object, or did not bind to the hook's parameters (`TypeError`) |
 | `tool_raised` | the hook raised anything else |
+| `bad_result` | the hook returned something that was not a string or `ToolResult`, or a `ToolResult` whose images were malformed |
 
 Do not signal failure by raising for control flow; return a string the model can
 act on. Either way the turn continues — a failing tool never aborts a
@@ -156,7 +182,7 @@ def install_executor(context: ToolContext, package: str) -> str:
 
 
 def install_rollback(context: ToolContext, package: str) -> str:
-    # `context.result` is what the call returned, in case the undo needs it
+    # `context.result` is the text the call returned, in case the undo needs it
     run(f"apt remove -y {package}")
     return f"removed {package}"
 

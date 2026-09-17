@@ -22,6 +22,23 @@ class ToolParam:
 
 
 @dataclass
+class ToolResult:
+    """What a hook hands back: text, optionally with images.
+
+    A hook may return a plain string, as before, or one of these when the model
+    should see images too. `images` takes the same shapes `fork` accepts: an
+    `http(s)` URL or `data:image/...` URI string, or a `{url, detail}` mapping.
+    A local path is refused — the harness never reads a file for a tool, and it
+    will not hand a provider one to open. The text is what events, failure
+    summaries and rollback reports carry; the image bytes only ever go into the
+    model's tool message.
+    """
+
+    text: str = ""
+    images: tuple[Any, ...] = ()
+
+
+@dataclass
 class ToolEntry:
     """A tool the model may call: its schema plus the hook that runs it.
 
@@ -38,7 +55,7 @@ class ToolEntry:
     name: str
     description: str
     params: list[ToolParam]
-    hook: Callable[..., str] | None = None
+    hook: Callable[..., str | ToolResult] | None = None
     state_namespace: str = ""
     # undo for this tool's calls, run when a turn does not commit; for a
     # client-run tool there is nothing callable here, so `remote_rollback`
@@ -103,7 +120,7 @@ class ToolContext:
     arguments: dict[str, Any]
     raw_arguments: Any
     state: dict[str, Any]
-    # set only for a rollback: what the call being undone returned
+    # set only for a rollback: the text the call being undone returned
     result: str | None = None
 
 

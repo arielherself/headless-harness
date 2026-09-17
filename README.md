@@ -98,7 +98,7 @@ protocol, the registry, persistence and eviction; `tests/test_store.py` and
 src/agent.py    HHAgent — one block of the chain; provider calls; state deltas
 src/server.py   HHServer — TCP listener, registry, JSONL protocol, eviction
 src/store.py    HHStore  — SQLite mirror, size budget, subtree eviction
-src/tools.py    ToolEntry / ToolContext and the builtin tools
+src/tools.py    ToolEntry / ToolContext / ToolResult and the builtin tools
 src/main.py     empty placeholder
 src/protocol.py the wire-protocol version shared by the server and the tools
 test.py         interactive client (gitignored: it holds the API key)
@@ -114,10 +114,13 @@ turn exactly once: it is `dirty` from `fork` until the turn ends, and forking
 from a dirty block is refused because its context is still growing. Rewinding is
 just forking from an earlier block again — the blocks beyond it stay untouched.
 
-**Images can ride along.** A fork may pass `images` — URLs or `data:` URIs —
-next to its prompt. Only then does the user message become a content-part list
+**Images can ride along.** A fork may pass `images` — `http(s)` URLs or
+`data:image/...` URIs, never a local path — next to its prompt. Only then does
+the user message become a content-part list
 (text first, then one `image_url` part each); `prompt` stays the text either
-way, so nothing that reads a block's prompt has to change. See
+way, so nothing that reads a block's prompt has to change. A tool result can
+carry images the same way: a server-side hook returns a `ToolResult`, and a
+local tool answers `resolve_tool` with `images`. See
 [`docs/protocol.md`](docs/protocol.md#images).
 
 **Tool state is incremental too.** A tool is handed a mutable `dict` already

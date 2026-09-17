@@ -627,6 +627,9 @@ class ForkTests(ServerTestCase):
         cases = [
             5,
             "",
+            "/etc/passwd",
+            "file:///etc/passwd",
+            "data:text/html;base64,AAAA",
             [{"url": 5}],
             [{"url": "x", "detail": 5}],
             [["nested"]],
@@ -1329,6 +1332,62 @@ class LocalToolProtocolTests(ServerTestCase):
         self.assertEqual(
             self.fetch_block(fixture, "a1").messages[2]["content"], '{"answer": 5}'
         )
+
+    def test_a_local_answer_may_carry_images_instead_of_text(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        self.create(client, "root", local_tools=[{"name": "ask_operator"}])
+        self.fork(client, "root", "ask", new_id="a1")
+        self.provider.script(
+            Response.tool_calls([("ask_operator", {}, "c1")]),
+            Response.text("nice"),
+        )
+        mark = client.mark()
+        client.send("run", rid="r1", id="a1")
+        client.wait_event("local_tool_called", since=mark)
+        data_uri = "data:image/png;base64,AAAA"
+        client.command("resolve_tool", id="a1", call_id="c1", images=[data_uri])
+        answered = client.wait_event("local_tool_answered")
+        self.assertTrue(answered["ok"])
+        self.assertEqual(answered["result_chars"], 0)
+        self.assertEqual(answered["image_count"], 1)
+        finished = client.wait_event("command_finished", since=mark, rid="r1")
+        self.assertEqual(finished["status"], "ok")
+        # the model sees the image alone as the tool message
+        self.assertEqual(
+            self.provider.last_payload()["messages"][-1],
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": [{"type": "image_url", "image_url": {"url": data_uri}}],
+            },
+        )
+        self.assertEqual(
+            self.fetch_block(fixture, "a1").messages[2]["content"],
+            [{"type": "image_url", "image_url": {"url": data_uri}}],
+        )
+
+    def test_resolve_tool_rejects_bad_images(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        self.create(client, "root", local_tools=[{"name": "ask_operator"}])
+        self.fork(client, "root", "ask", new_id="a1")
+        self.provider.script(
+            Response.tool_calls([("ask_operator", {}, "c1")]),
+            Response.text("ok"),
+        )
+        mark = client.mark()
+        client.send("run", rid="r1", id="a1")
+        client.wait_event("local_tool_called", since=mark)
+        client.send(
+            "resolve_tool", rid="r2", id="a1", call_id="c1", images=[{"url": 5}]
+        )
+        client.wait_error("r2", code="bad_image")
+        # the call is still parked, so it can be answered properly
+        self.assertEqual(self.fetch_block(fixture, "a1").pending_calls(), ["c1"])
+        client.command("resolve_tool", id="a1", call_id="c1", result="fine")
+        finished = client.wait_event("command_finished", since=mark, rid="r1")
+        self.assertEqual(finished["status"], "ok")
 
     def test_resolving_a_call_nothing_waits_on(self):
         fixture = self.start_server()

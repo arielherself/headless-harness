@@ -21,7 +21,8 @@ Commands
     get_context    {id}                                flattened message list
     get_state      {id, tool?}                         rebuilt tool state
     set_state      {id, tool, key, value?/delete?}     seed or drop a state key
-    resolve_tool   {id, call_id, result?, error?}      answer a local tool call
+    resolve_tool   {id, call_id, result?, images?,
+                    error?}                            answer a local tool call
     list_agents    {}                                  every block, with links
     destroy_agent  {id}                                drop a block and its subtree
     ping           {echo?}
@@ -132,8 +133,8 @@ COMMANDS: list[dict[str, Any]] = [
             "id": "required, the block to fork from",
             "prompt": "required, non-empty string",
             "images": (
-                "optional list of image URLs or data: URIs; each a string "
-                "or {url, detail}"
+                "optional list of http(s) URLs or data:image/... URIs; each a "
+                "string or {url, detail}"
             ),
             "new_id": "optional id for the new block",
             "model": "optional override inherited from the parent",
@@ -196,7 +197,8 @@ COMMANDS: list[dict[str, Any]] = [
         "fields": {
             "id": "required, the block whose turn is waiting",
             "call_id": "required, from the local_tool_called event",
-            "result": "the string handed back to the model",
+            "result": "the text handed back to the model; optional when 'images' is given",
+            "images": "optional list of http(s) URLs or data:image/... URIs the tool returned",
             "error": "optional; marks the call failed and is reported as such",
         },
     },
@@ -765,14 +767,17 @@ class HHServer(socketserver.ThreadingTCPServer):
         error = command.get("error")
         if error is not None and (not isinstance(error, str) or not error):
             raise HHTcpError("bad_field", "'error' must be a non-empty string")
-        if "result" not in command and error is None:
-            raise HHTcpError("bad_field", "resolve_tool needs 'result' or 'error'")
+        images = parse_images(command.get("images"))
+        if "result" not in command and error is None and not images:
+            raise HHTcpError(
+                "bad_field", "resolve_tool needs 'result', 'images' or 'error'"
+            )
         result = command.get("result")
         if result is None:
             result = ""
         elif not isinstance(result, str):
             result = json.dumps(result, ensure_ascii=False, default=str)
-        if not block.resolve_local_call(call_id, result, error):
+        if not block.resolve_local_call(call_id, result, error, images):
             raise HHTcpError(
                 "unknown_call",
                 f"agent {agent_id!r} is not waiting on {call_id!r}",
@@ -785,6 +790,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             call_id=call_id,
             ok=error is None,
             result_chars=len(result),
+            image_count=len(images),
         )
 
     def cmd_ping(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:

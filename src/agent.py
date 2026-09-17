@@ -9,7 +9,7 @@ from typing import Any, Self
 
 import requests
 
-from tools import ToolContext, ToolEntry, builtin_tools
+from tools import ToolContext, ToolEntry, ToolResult, builtin_tools
 
 # Must be a model the provider serves over the OpenAI chat/completions shape;
 # the `claude-*` models are rejected here and only accept /v1/messages.
@@ -52,14 +52,46 @@ def new_id() -> str:
     return f"agent-{uuid.uuid4().hex[:12]}"
 
 
+def _check_image_url(url: str, where: str) -> None:
+    """Refuse anything that is not an http(s) URL or a data:image/... URI.
+
+    A local path — or any other scheme, `file:` included — would hand the
+    provider a local file to open. The harness never reads one on a client's
+    behalf, and a path must not reach a provider that would.
+    """
+    lowered = url.lower()
+    if lowered.startswith("data:image/"):
+        return
+    if lowered.startswith("data:"):
+        raise HHAgentError(
+            f"{where} must be a data:image/... URI or an http(s) URL; "
+            "that data: URI is not an image"
+        )
+    scheme, sep, rest = url.partition("://")
+    if sep and rest and scheme.lower() in ("http", "https"):
+        return
+    if not sep or scheme.lower() == "file":
+        raise HHAgentError(
+            f"{where} must be a data:image/... URI or an http(s) URL; "
+            "local paths and file: URLs are never read"
+        )
+    raise HHAgentError(
+        f"{where} must be a data:image/... URI or an http(s) URL; "
+        f"the {scheme.lower()!r} scheme is not accepted"
+    )
+
+
 def image_content_parts(images: Any) -> list[dict[str, Any]]:
     """Normalize images into the content parts the provider expects.
 
-    Each image is a URL or `data:` URI string, or a mapping with a non-empty
-    `url` and an optional `detail` (`auto`, `low` or `high`, passed through).
-    `None`, an empty sequence and a single entry are all accepted, as is an
-    already-normalized `image_url` part. Anything else raises `HHAgentError`,
-    so a bad image fails the fork rather than reaching the provider.
+    Each image is an `http(s)` URL or a `data:image/...` URI string, or a
+    mapping with a non-empty `url` and an optional `detail` (`auto`, `low` or
+    `high`, passed through). Local paths and other schemes (`file:` included)
+    are refused: the harness never reads a file for a client, and it will not
+    hand a provider a path to open. `None`, an empty sequence and a single
+    entry are all accepted, as is an already-normalized `image_url` part.
+    Anything else raises `HHAgentError`, so a bad image fails the fork rather
+    than reaching the provider.
     """
     if images is None:
         return []
@@ -67,7 +99,8 @@ def image_content_parts(images: Any) -> list[dict[str, Any]]:
         images = [images]
     if not isinstance(images, (list, tuple)):
         raise HHAgentError(
-            "images must be a list of URL strings or {url, detail} objects"
+            "images must be a list of image URLs, data:image/... URIs "
+            "or {url, detail} objects"
         )
     parts: list[dict[str, Any]] = []
     for index, image in enumerate(images):
@@ -78,6 +111,7 @@ def image_content_parts(images: Any) -> list[dict[str, Any]]:
             url = nested.get("url") if isinstance(nested, Mapping) else None
             if not isinstance(url, str) or not url:
                 raise HHAgentError(f"{where} needs a non-empty 'url'")
+            _check_image_url(url, where)
             parts.append(part)
             continue
         if isinstance(image, str):
@@ -90,6 +124,7 @@ def image_content_parts(images: Any) -> list[dict[str, Any]]:
             )
         if not isinstance(url, str) or not url:
             raise HHAgentError(f"{where} needs a non-empty 'url'")
+        _check_image_url(url, where)
         if detail is not None and not isinstance(detail, str):
             raise HHAgentError(f"{where} has a non-string 'detail'")
         rendered: dict[str, Any] = {"type": "image_url", "image_url": {"url": url}}
@@ -127,6 +162,19 @@ def message_image_count(content: Any) -> int:
     )
 
 
+def content_with_images(text: str, parts: Iterable[dict[str, Any]]) -> Any:
+    """A message's `content`: plain text, or text and images as parts.
+
+    Without images the content stays the string it has always been; with them
+    it becomes an OpenAI-style content list, and the text part is omitted when
+    there is no text to send.
+    """
+    parts = list(parts)
+    if not parts:
+        return text
+    return ([{"type": "text", "text": text}] if text else []) + parts
+
+
 def _parse_arguments(name: str, raw_arguments: Any) -> tuple[Any, str | None]:
     """Decode a tool call's arguments, or explain why they are unusable."""
     if isinstance(raw_arguments, str):
@@ -139,20 +187,27 @@ def _parse_arguments(name: str, raw_arguments: Any) -> tuple[Any, str | None]:
     return {}, None
 
 
-def _run_hook(tool: ToolEntry, context: ToolContext) -> tuple[str, str | None]:
-    """Run a tool hook: returns the text for the model and why it failed."""
+def _run_hook(tool: ToolEntry, context: ToolContext) -> tuple["_ToolReply", str | None]:
+    """Run a tool hook: returns its reply and why it failed."""
     hook = tool.hook
     if hook is None:
-        return f"Error: tool '{tool.name}' has no hook", "no_hook"
+        return _reply(f"Error: tool '{tool.name}' has no hook"), "no_hook"
     try:
-        return hook(context, **context.arguments), None
+        returned = hook(context, **context.arguments)
     except TypeError as exc:
-        return f"Error: bad arguments for '{tool.name}': {exc}", "bad_arguments"
+        return (
+            _reply(f"Error: bad arguments for '{tool.name}': {exc}"),
+            "bad_arguments",
+        )
     except Exception as exc:  # a failing tool must not abort the conversation
         return (
-            f"Error: tool '{tool.name}' raised {type(exc).__name__}: {exc}",
+            _reply(f"Error: tool '{tool.name}' raised {type(exc).__name__}: {exc}"),
             "tool_raised",
         )
+    try:
+        return _tool_reply(returned), None
+    except HHAgentError as exc:
+        return _reply(f"Error: tool '{tool.name}' {exc}"), "bad_result"
 
 
 def _same_value(before: Any, after: Any) -> bool:
@@ -179,6 +234,8 @@ class _Pending:
     event: threading.Event
     result: str | None = None
     error: str | None = None
+    # already-normalized image parts from the client's answer
+    images: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -191,6 +248,40 @@ class _Call:
     raw_arguments: Any
     result: str
     ok: bool
+
+
+@dataclass
+class _ToolReply:
+    """One tool call's answer, in the shapes the rest of the turn needs."""
+
+    # what goes into the tool message: a string, or a content-part list
+    content: Any = ""
+    # the text alone, for events, failure notes and rollback reports
+    text: str = ""
+    image_count: int = 0
+
+
+def _reply(text: str, parts: Iterable[dict[str, Any]] = ()) -> _ToolReply:
+    """A reply built from text and already-normalized image parts."""
+    parts = list(parts)
+    return _ToolReply(
+        content=content_with_images(text, parts),
+        text=text,
+        image_count=len(parts),
+    )
+
+
+def _tool_reply(returned: Any) -> _ToolReply:
+    """Normalize whatever a hook returned: a string, or a `ToolResult`."""
+    if isinstance(returned, ToolResult):
+        if not isinstance(returned.text, str):
+            raise HHAgentError("returned a ToolResult whose text is not a string")
+        return _reply(returned.text, image_content_parts(returned.images))
+    if isinstance(returned, str):
+        return _reply(returned)
+    raise HHAgentError(
+        f"returned {type(returned).__name__}, expected a string or ToolResult"
+    )
 
 
 @dataclass
@@ -388,12 +479,13 @@ class HHAgent:
     ) -> Self:
         """Start the next block, holding `message` as its user prompt.
 
-        `images`, when given, is a list of image URLs or `data:` URIs — strings,
-        or `{url, detail}` mappings. The child's user message then becomes a
-        content-part list: the text first, then one `image_url` part per image.
-        `prompt` stays the text either way, and without images the message
-        remains the plain string it has always been. Images are validated here,
-        so a bad one fails the fork before a block exists.
+        `images`, when given, is a list of `http(s)` URLs or `data:image/...`
+        URIs — strings, or `{url, detail}` mappings; a local path is refused.
+        The child's user message then becomes a content-part list: the text
+        first, then one `image_url` part per image. `prompt` stays the text
+        either way, and without images the message remains the plain string it
+        has always been. Images are validated here, so a bad one fails the fork
+        before a block exists.
 
         The child inherits this block's provider, model, tools and options, and
         starts out `dirty` because its turn has not run yet. Override any of
@@ -410,10 +502,9 @@ class HHAgent:
         child.id = id or new_id()
         child.parent = self
         child.prompt = message
-        content: Any = message
-        if parts:
-            content = [{"type": "text", "text": message}, *parts]
-        child.messages = [{"role": "user", "content": content}]
+        child.messages = [
+            {"role": "user", "content": content_with_images(message, parts)}
+        ]
         child.dirty = True
         child.endpoint = self.endpoint
         child.key = self.key
@@ -570,19 +661,29 @@ class HHAgent:
         return sorted(self._pending)
 
     def resolve_local_call(
-        self, call_id: str, result: str, error: str | None = None
+        self,
+        call_id: str,
+        result: str,
+        error: str | None = None,
+        images: Any = None,
     ) -> bool:
         """Hand a client's answer to the turn that is waiting for it.
+
+        `images` takes the same shapes as `fork`'s and is normalized here, so a
+        bad one raises before the waiting turn is woken. An answer that reports
+        an `error` is text: images sent with it are dropped.
 
         Returns False when nothing is waiting on that id any more — the call
         timed out, was cancelled, or never existed. The turn is woken by the
         event and reads the answer on its own thread.
         """
+        parts = image_content_parts(images)
         pending = self._pending.get(call_id)
         if pending is None:
             return False
         pending.result = result
         pending.error = error
+        pending.images = parts
         pending.event.set()
         return True
 
@@ -594,7 +695,7 @@ class HHAgent:
         raw: Any,
         hook: EventHook | None,
         round_no: int,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[_ToolReply, str | None]:
         """Announce a client-side tool call, then wait for the answer."""
         return self._ask_client(
             hook,
@@ -619,7 +720,7 @@ class HHAgent:
         timeout: float,
         reason: str,
         stop_on_cancel: bool,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[_ToolReply, str | None]:
         """Announce something the client has to do and wait for its answer.
 
         The wait holds nothing but an event: no registry lock, no store lock and
@@ -657,7 +758,9 @@ class HHAgent:
                         waited_ms=self._ms(started),
                     )
                     return (
-                        f"Error: local tool '{name}' was not answered ({reason})",
+                        _reply(
+                            f"Error: local tool '{name}' was not answered ({reason})"
+                        ),
                         reason,
                     )
                 if pending.event.wait(min(0.2, remaining)):
@@ -677,9 +780,12 @@ class HHAgent:
                             f"agent {self.id} cancelled while waiting for {name}"
                         )
                     return (
-                        f"Error: local tool '{name}' was not answered (cancelled)",
+                        _reply(
+                            f"Error: local tool '{name}' was not answered (cancelled)"
+                        ),
                         "cancelled",
                     )
+            text = pending.result or ""
             self._emit(
                 hook,
                 "local_tool_resolved",
@@ -688,16 +794,18 @@ class HHAgent:
                 kind=kind,
                 ok=pending.error is None,
                 error=pending.error,
-                result=pending.result,
-                result_chars=len(pending.result or ""),
+                result=text,
+                result_chars=len(text),
+                image_count=len(pending.images),
                 waited_ms=self._ms(started),
             )
             if pending.error is not None:
+                # an error answer stays text; any images sent with it are dropped
                 return (
-                    pending.result or f"Error: local tool '{name}': {pending.error}",
+                    _reply(text or f"Error: local tool '{name}': {pending.error}"),
                     pending.error,
                 )
-            return pending.result or "", None
+            return _reply(text, pending.images), None
         finally:
             self._pending.pop(call_id, None)
 
@@ -749,7 +857,7 @@ class HHAgent:
             )
             started = time.monotonic()
             if tool.is_local:
-                text, error = self._ask_client(
+                reply, error = self._ask_client(
                     hook,
                     "local_tool_rollback",
                     f"{call.call_id}:rollback",
@@ -765,6 +873,7 @@ class HHAgent:
                     "timeout" if outcome == "failed" else outcome,
                     stop_on_cancel=False,
                 )
+                text = reply.text
             else:
                 text, error = self._invoke_rollback(tool, call)
             self._emit(
@@ -1426,14 +1535,14 @@ class HHAgent:
             started = time.monotonic()
             tool = self.tools.get(name)
             if tool is None:
-                text, error = f"Error: unknown tool '{name}'", "unknown_tool"
+                reply, error = _reply(f"Error: unknown tool '{name}'"), "unknown_tool"
             else:
                 arguments, parse_error = _parse_arguments(name, raw)
                 if parse_error is not None:
-                    text, error = parse_error, "bad_arguments"
+                    reply, error = _reply(parse_error), "bad_arguments"
                 elif not isinstance(arguments, dict):
-                    text, error = (
-                        f"Error: arguments for '{name}' must be a JSON object",
+                    reply, error = (
+                        _reply(f"Error: arguments for '{name}' must be a JSON object"),
                         "bad_arguments",
                     )
                 elif tool.is_local:
@@ -1443,10 +1552,10 @@ class HHAgent:
                     # needs its undo offered
                     call = _Call(tool, call_id, arguments, raw, "", False)
                     self._called.append(call)
-                    text, error = self._answer_local(
+                    reply, error = self._answer_local(
                         tool, call_id, arguments, raw, hook, round_no
                     )
-                    call.result, call.ok = text, error is None
+                    call.result, call.ok = reply.text, error is None
                 else:
                     context = ToolContext(
                         tool=tool,
@@ -1466,10 +1575,17 @@ class HHAgent:
                         keys=sorted(context.state),
                         inherited=len(self._state_bases.get(tool.namespace) or {}),
                     )
-                    text, error = _run_hook(tool, context)
+                    reply, error = _run_hook(tool, context)
                     if error not in NOT_RUN:
                         self._called.append(
-                            _Call(tool, call_id, arguments, raw, text, error is None)
+                            _Call(
+                                tool,
+                                call_id,
+                                arguments,
+                                raw,
+                                reply.text,
+                                error is None,
+                            )
                         )
             self._emit(
                 hook,
@@ -1479,11 +1595,14 @@ class HHAgent:
                 name=name,
                 ok=error is None,
                 error=error,
-                result=text,
-                result_chars=len(text),
+                result=reply.text,
+                result_chars=len(reply.text),
+                image_count=reply.image_count,
                 elapsed_ms=self._ms(started),
             )
-            results.append({"role": "tool", "tool_call_id": call_id, "content": text})
+            results.append(
+                {"role": "tool", "tool_call_id": call_id, "content": reply.content}
+            )
         return results
 
     def _remember(

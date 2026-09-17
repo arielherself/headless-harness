@@ -121,10 +121,11 @@ class IdAndParsingTests(unittest.TestCase):
         context = tools.ToolContext(
             tool=tool, agent=None, call_id="c", arguments={}, raw_arguments=None, state={}
         )
-        self.assertEqual(
-            agent._run_hook(tool, context),
-            ("Error: tool 'local' has no hook", "no_hook"),
-        )
+        reply, error = agent._run_hook(tool, context)
+        self.assertEqual(error, "no_hook")
+        self.assertEqual(reply.text, "Error: tool 'local' has no hook")
+        self.assertEqual(reply.content, "Error: tool 'local' has no hook")
+        self.assertEqual(reply.image_count, 0)
 
     def test_run_hook_bad_signature_is_bad_arguments(self):
         context = tools.ToolContext(
@@ -135,17 +136,68 @@ class IdAndParsingTests(unittest.TestCase):
             raw_arguments="{}",
             state={},
         )
-        text, error = agent._run_hook(REMEMBER, context)
+        reply, error = agent._run_hook(REMEMBER, context)
         self.assertEqual(error, "bad_arguments")
-        self.assertIn("bad arguments for 'remember'", text)
+        self.assertIn("bad arguments for 'remember'", reply.text)
 
     def test_run_hook_exception_is_contained(self):
         context = tools.ToolContext(
             tool=BOOM, agent=None, call_id="c", arguments={}, raw_arguments="{}", state={}
         )
-        text, error = agent._run_hook(BOOM, context)
+        reply, error = agent._run_hook(BOOM, context)
         self.assertEqual(error, "tool_raised")
-        self.assertEqual(text, "Error: tool 'boom' raised ValueError: tool exploded")
+        self.assertEqual(reply.text, "Error: tool 'boom' raised ValueError: tool exploded")
+
+    def _hook_context(self, tool):
+        return tools.ToolContext(
+            tool=tool, agent=None, call_id="c", arguments={}, raw_arguments="{}", state={}
+        )
+
+    def test_run_hook_normalizes_a_tool_result(self):
+        data_uri = "data:image/png;base64,AAAA"
+
+        def shot(context):
+            return tools.ToolResult("see this", images=[data_uri])
+
+        tool = server_tool("shot", shot)
+        reply, error = agent._run_hook(tool, self._hook_context(tool))
+        self.assertIsNone(error)
+        self.assertEqual(reply.text, "see this")
+        self.assertEqual(reply.image_count, 1)
+        self.assertEqual(
+            reply.content,
+            [
+                {"type": "text", "text": "see this"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        )
+
+    def test_run_hook_rejects_other_return_types(self):
+        def wrong(context):
+            return {"text": "no"}
+
+        tool = server_tool("wrong", wrong)
+        reply, error = agent._run_hook(tool, self._hook_context(tool))
+        self.assertEqual(error, "bad_result")
+        self.assertIn("expected a string or ToolResult", reply.text)
+
+    def test_run_hook_rejects_bad_images_in_a_tool_result(self):
+        def wrong(context):
+            return tools.ToolResult("x", images=[{"url": 5}])
+
+        tool = server_tool("wrong", wrong)
+        reply, error = agent._run_hook(tool, self._hook_context(tool))
+        self.assertEqual(error, "bad_result")
+        self.assertIn("needs a non-empty 'url'", reply.text)
+
+    def test_run_hook_refuses_a_local_path_in_a_tool_result(self):
+        def wrong(context):
+            return tools.ToolResult("x", images=["/etc/passwd"])
+
+        tool = server_tool("wrong", wrong)
+        reply, error = agent._run_hook(tool, self._hook_context(tool))
+        self.assertEqual(error, "bad_result")
+        self.assertIn("http(s) URL", reply.text)
 
     def test_not_run_codes_are_just_the_two(self):
         self.assertEqual(set(agent.NOT_RUN), {"bad_arguments", "no_hook"})
@@ -373,6 +425,25 @@ class RootAndForkTests(HHTestCase):
         ):
             with self.assertRaises(agent.HHAgentError):
                 root.fork("look", images=bad)
+        self.assertFalse(root.dirty)
+
+    def test_a_local_path_is_never_accepted_as_an_image(self):
+        root = self.root()
+        for bad in (
+            "/home/me/pic.png",
+            "./pic.png",
+            "../pic.png",
+            "file:///home/me/pic.png",
+            "ftp://host/pic.png",
+            "data:text/html;base64,AAAA",
+            {"url": "file:///etc/passwd"},
+            {"type": "image_url", "image_url": {"url": "/etc/passwd"}},
+        ):
+            with self.assertRaises(agent.HHAgentError) as caught:
+                root.fork("look", images=[bad])
+            self.assertIn(
+                "data:image/... URI or an http(s) URL", str(caught.exception)
+            )
         self.assertFalse(root.dirty)
 
     def test_fork_images_may_be_already_normalized_parts(self):
@@ -1095,6 +1166,71 @@ class ToolRoundTests(HHTestCase):
             finished["result"], "Error: arguments for 'remember' must be a JSON object"
         )
 
+    def test_a_hook_may_return_images_with_its_text(self):
+        data_uri = "data:image/png;base64,AAAA"
+
+        def screenshot(context):
+            return tools.ToolResult("here is the screen", images=[data_uri])
+
+        self.provider.script(
+            Response.tool_call("screenshot", {}, "c1"),
+            Response.text("thanks"),
+        )
+        block = self.root(tools=[server_tool("screenshot", screenshot)]).fork("shot")
+        thread = self.turn(block)
+        thread.join()
+        self.assertIsNone(thread.error)
+
+        # the model sees the text and the image as one tool message
+        self.assertEqual(
+            self.provider.last_payload()["messages"][-1],
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": [
+                    {"type": "text", "text": "here is the screen"},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            },
+        )
+        self.assertEqual(
+            block.messages[2]["content"],
+            [
+                {"type": "text", "text": "here is the screen"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        )
+        # events report the text and count the image, never its bytes
+        finished = thread.last("tool_call_finished")
+        self.assertTrue(finished["ok"])
+        self.assertEqual(finished["result"], "here is the screen")
+        self.assertEqual(finished["result_chars"], len("here is the screen"))
+        self.assertEqual(finished["image_count"], 1)
+        appended = [
+            event
+            for event in thread.events
+            if event["event"] == "history_appended" and event["source"] == "tool"
+        ][-1]
+        self.assertEqual(appended["image_count"], 1)
+
+    def test_images_in_a_tool_message_stay_out_of_the_failure_summary(self):
+        data_uri = "data:image/png;base64,SUPERSECRETBYTES"
+
+        def screenshot(context):
+            return tools.ToolResult("screen attached", images=[data_uri])
+
+        self.provider.script(
+            Response.tool_call("screenshot", {}, "c1"),
+            Response.error(503),
+            Response.text("it took a screenshot"),
+        )
+        block = self.root(tools=[server_tool("screenshot", screenshot)]).fork("shot")
+        thread = self.turn(block)
+        thread.join()
+        transcript = self.provider.last_payload()["messages"][1]["content"]
+        self.assertIn("screen attached", transcript)
+        self.assertNotIn("SUPERSECRETBYTES", transcript)
+
     def test_unknown_tool(self):
         self.provider.script(
             Response.tool_calls([("no_such_tool", {"a": 1})]),
@@ -1458,6 +1594,45 @@ class LocalToolTests(HHTestCase):
 
     def test_resolving_an_unknown_call_is_refused(self):
         self.assertFalse(self.root(tools=[]).fork("hi").resolve_local_call("nope", "x"))
+
+    def test_a_local_answer_may_carry_images(self):
+        data_uri = "data:image/png;base64,AAAA"
+        self.provider.script(
+            Response.tool_calls([("ask_operator", {}, "c1")]),
+            Response.text("nice"),
+        )
+        block = self.root(tools=[local_tool("ask_operator")]).fork("ask")
+        thread = self.turn(block)
+        thread.wait_event("local_tool_called")
+        self.assertTrue(block.resolve_local_call("c1", "look at this", images=[data_uri]))
+        thread.join()
+        self.assertIsNone(thread.error)
+        self.assertEqual(
+            block.messages[2]["content"],
+            [
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        )
+        resolved = thread.last("local_tool_resolved")
+        self.assertEqual(resolved["result"], "look at this")
+        self.assertEqual(resolved["image_count"], 1)
+        self.assertEqual(thread.last("tool_call_finished")["image_count"], 1)
+
+    def test_a_bad_image_in_a_local_answer_leaves_the_call_parked(self):
+        self.provider.script(
+            Response.tool_calls([("ask_operator", {}, "c1")]),
+            Response.text("ok"),
+        )
+        block = self.root(tools=[local_tool("ask_operator")]).fork("ask")
+        thread = self.turn(block)
+        thread.wait_event("local_tool_called")
+        with self.assertRaisesRegex(agent.HHAgentError, "non-empty 'url'"):
+            block.resolve_local_call("c1", "x", images=[{"url": 5}])
+        self.assertEqual(block.pending_calls(), ["c1"])
+        block.resolve_local_call("c1", "fine")
+        thread.join()
+        self.assertIsNone(thread.error)
 
     def test_a_local_call_can_be_answered_with_an_error(self):
         self.provider.script(

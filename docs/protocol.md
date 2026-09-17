@@ -120,8 +120,8 @@ two consecutive lines without waiting for `agent_forked`.
 #### Images
 
 `fork` may carry images alongside the prompt. `images` is a list whose entries
-are either a string — an `https:` URL or a `data:` URI — or an object with a
-`url` and an optional `detail` (`auto`, `low` or `high`):
+are either a string — an `http(s)` URL or a `data:image/...` URI — or an object
+with a `url` and an optional `detail` (`auto`, `low` or `high`):
 
 ```jsonc
 {"command":"fork","rid":"3","id":"root","new_id":"a1","prompt":"what is this?",
@@ -139,13 +139,24 @@ both cases:
                           {"type":"image_url","image_url":{"url":"data:…"}}]}
 ```
 
+A local path is refused (`bad_image`), as is any other scheme — `file:`
+included. The server never reads a file on a client's behalf, and it will not
+hand a provider a path to open either. A client that has a local file reads it
+itself and sends a `data:image/...` URI, which is what `test.py` does.
+
 Images ride in the same single JSON line as everything else, so a `data:` URI
 counts against the 8 MiB limit (base64 adds about a third). `prompt` stays
 required and non-empty: images ride along with text, they do not replace it.
 `image_count` reports how many parts a block holds without echoing the bytes.
-This arrived in protocol `3`: a `2` server does not know the field and would
-ignore it, so check `session_hello.protocol` before sending images to an
-unknown server.
+
+Tool results can carry images too: a local tool answers with `images` on
+`resolve_tool`, and a server-side hook returns a `ToolResult` (see
+[`tools.md`](tools.md)). The same shapes apply, and events report them by
+`image_count` as well.
+
+All of this arrived in protocol `3`: a `2` server does not know the `images`
+fields and would ignore them, so check `session_hello.protocol` before sending
+images to an unknown server.
 
 ### `run`
 
@@ -250,11 +261,14 @@ running block**, unlike `set_state`: the block being parked is the whole point.
 |---|---|
 | `id` | **required** — the block whose turn is waiting, from the event |
 | `call_id` | **required** — from the `local_tool_called` event |
-| `result` | the string handed back to the model; a non-string is JSON-encoded |
+| `result` | the text handed back to the model; a non-string is JSON-encoded; optional when `images` is given |
+| `images` | optional list of http(s) URLs or data:image/... URIs the tool returned (see [Images](#images)) |
 | `error` | optional; marks the call failed and is reported to the model as such |
 
-→ `local_tool_answered` (`call_id`, `ok`, `result_chars`), and the parked turn
-resumes.
+→ `local_tool_answered` (`call_id`, `ok`, `result_chars`, `image_count`), and the
+parked turn resumes. The images become part of the tool message the model sees,
+the same way a fork's images become part of the user message; an answer that
+carries `error` stays text and its images, if any, are dropped.
 
 Errors: `bad_id`, `unknown_agent`, `bad_field`, `unknown_call` — nothing is
 waiting on that id any more (it timed out, was cancelled, or never existed), and
@@ -297,7 +311,7 @@ unreadable row).
 | `context` | see the command above |
 | `state` | see the command above |
 | `state_seeded` | see the command above |
-| `local_tool_answered` | `rid`, `agent_id`, `call_id`, `ok`, `result_chars` |
+| `local_tool_answered` | `rid`, `agent_id`, `call_id`, `ok`, `result_chars`, `image_count` |
 | `pong` | see the command above |
 | `error` | `code`, `message`, `rid`, `command`, plus a case-specific `detail`; `internal_error` adds `traceback`, `bad_json` adds `line`, `command_too_large` adds `bytes`, `unknown_command` adds `commands` |
 
@@ -341,11 +355,11 @@ requests tools is followed by another round until the model answers with text.
 |---|---|
 | `tool_call_requested` | `round`, `call_id`, `name`, `raw_arguments`, `known` |
 | `tool_call_started` | `round`, `call_id`, `name` |
-| `tool_call_finished` | `round`, `call_id`, `name`, `ok`, `error`, `result`, `result_chars`, `elapsed_ms` |
+| `tool_call_finished` | `round`, `call_id`, `name`, `ok`, `error`, `result` (the text), `result_chars`, `image_count`, `elapsed_ms` |
 
 `error` is a code, not a message: `unknown_tool`, `bad_arguments`, `tool_raised`,
-`timeout`, or `no_hook`. A tool that fails still produces a result, which is fed
-back to the model so it can correct itself.
+`bad_result`, `timeout`, or `no_hook`. A tool that fails still produces a result,
+which is fed back to the model so it can correct itself.
 
 Calls to a **local tool** — one this client declared — announce themselves
 instead of running:
@@ -354,7 +368,7 @@ instead of running:
 |---|---|
 | `local_tool_called` | `round`, `call_id`, `name`, `kind` (`call`), `arguments`, `raw_arguments`, `timeout_ms` — the turn is now parked on this |
 | `local_tool_rollback` | `call_id` (of the undo), `name`, `kind` (`rollback`), `rollback_of`, `arguments`, `result`, `call_ok`, `timeout_ms` |
-| `local_tool_resolved` | `call_id`, `name`, `kind`, `ok`, `error`, `result`, `result_chars`, `waited_ms` |
+| `local_tool_resolved` | `call_id`, `name`, `kind`, `ok`, `error`, `result` (the text), `result_chars`, `image_count`, `waited_ms` |
 | `local_tool_unresolved` | `call_id`, `name`, `kind`, `reason` (`timeout` / `cancelled`), `waited_ms` |
 
 `kind` distinguishes a call the model asked for from an undo the harness is asking
@@ -520,6 +534,7 @@ client-run in its definition — or the note will quietly leave them out.
 | `bad_id` | `id` / `new_id` missing or not a non-empty string |
 | `bad_prompt` | `prompt` missing or empty |
 | `bad_image` | `images` was malformed: not a list, an entry without a non-empty `url`, or a non-string `detail` |
+| `bad_result` | a tool hook returned something other than a string or `ToolResult`, or a `ToolResult` whose images were malformed |
 | `bad_field` | a field had the wrong type or value |
 | `bad_tools` | `tools` / `local_tools` was malformed, or a name is declared twice |
 | `unknown_tool` | a name is not in the catalogue |

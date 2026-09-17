@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
 
 from agent import HHAgent, StateDelta
-from tools import ToolEntry, builtin_tools
+from tools import ToolEntry, ToolParam, builtin_tools
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS blocks (
@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     timeout       REAL NOT NULL,
     include_usage INTEGER NOT NULL,
     verbose       INTEGER NOT NULL,
-    tool_names    TEXT NOT NULL
+    tool_names    TEXT NOT NULL,
+    local_tools   TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS blocks_parent ON blocks (parent_id);
 CREATE INDEX IF NOT EXISTS blocks_created ON blocks (created_at);
@@ -63,13 +64,14 @@ CREATE INDEX IF NOT EXISTS blocks_created ON blocks (created_at);
 
 COLUMNS = (
     "id, parent_id, prompt, messages, state_deltas, text, error, dirty, "
-    "created_at, endpoint, model, timeout, include_usage, verbose, tool_names"
+    "created_at, endpoint, model, timeout, include_usage, verbose, tool_names, "
+    "local_tools"
 )
 
 # Columns refreshed when a block that already has a row changes.
 UPDATABLE = (
     "prompt, messages, state_deltas, text, error, dirty, created_at, endpoint, "
-    "model, timeout, include_usage, verbose, tool_names"
+    "model, timeout, include_usage, verbose, tool_names, local_tools"
 )
 
 # A subtree that may be reclaimed: a root, or a block whose parent has forks.
@@ -126,7 +128,21 @@ class HHStore:
             if self._db.execute("PRAGMA auto_vacuum").fetchone()[0] != 1:
                 self._db.execute("VACUUM")
             self._db.executescript(SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self) -> None:
+        """Bring a file written by an older version up to the current schema.
+
+        SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list is checked
+        first. Only additive changes are handled here; anything structural would
+        need a real migration step.
+        """
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_info(blocks)")}
+        if "local_tools" not in columns:
+            self._db.execute(
+                "ALTER TABLE blocks ADD COLUMN local_tools TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def _claim_file(self) -> Any:
         if fcntl is None:
@@ -172,7 +188,8 @@ class HHStore:
             float(block.timeout),
             int(block.include_usage),
             int(block.verbose),
-            json.dumps(sorted(block.tools)),
+            json.dumps(sorted(t.name for t in block.tools.values() if not t.is_local)),
+            json.dumps(self._encode_local_tools(block), ensure_ascii=False),
         )
         assignments = ", ".join(
             f"{name.strip()} = excluded.{name.strip()}"
@@ -213,11 +230,12 @@ class HHStore:
             missing = [name for name in names if name not in self.tools]
             if missing:
                 warnings.append(f"{row['id']}: missing tools {missing}")
+            local = [self._decode_local_tool(entry) for entry in json.loads(row["local_tools"])]
             block = HHAgent.root(
                 row["endpoint"],
                 key,
                 model=row["model"],
-                tools=[self.tools[name] for name in names if name in self.tools],
+                tools=[self.tools[name] for name in names if name in self.tools] + local,
                 timeout=row["timeout"],
                 include_usage=bool(row["include_usage"]),
                 verbose=bool(row["verbose"]),
@@ -286,6 +304,42 @@ class HHStore:
             "bytes": self.size_bytes(),
             "max_bytes": self.max_bytes,
         }
+
+    # --- local tools -----------------------------------------------------
+    @staticmethod
+    def _encode_local_tools(block: HHAgent) -> list[dict[str, Any]]:
+        """The definitions of the tools the client runs, for a later restart.
+
+        A local tool is only a schema — the hook lives on the client — so unlike
+        a builtin it can be stored whole rather than by name.
+        """
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "params": [
+                    {"name": p.name, "type": p.type, "description": p.description}
+                    for p in tool.params
+                ],
+            }
+            for tool in block.tools.values()
+            if tool.is_local
+        ]
+
+    @staticmethod
+    def _decode_local_tool(entry: dict[str, Any]) -> ToolEntry:
+        return ToolEntry(
+            name=entry["name"],
+            description=entry.get("description", ""),
+            params=[
+                ToolParam(
+                    name=p["name"], type=p.get("type", "string"),
+                    description=p.get("description", ""),
+                )
+                for p in entry.get("params") or []
+            ],
+            hook=None,
+        )
 
     # --- encoding --------------------------------------------------------
     @staticmethod

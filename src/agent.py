@@ -15,6 +15,8 @@ from tools import ToolContext, ToolEntry, builtin_tools
 # the `claude-*` models are rejected here and only accept /v1/messages.
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 DEFAULT_TIMEOUT = 120.0
+# how long a turn waits for a client to answer a local tool call
+DEFAULT_LOCAL_TIMEOUT = 120.0
 MAX_TOOL_ROUNDS = 120
 
 # A hook receiving one event dict per thing that happens during a turn.
@@ -48,8 +50,11 @@ def _parse_arguments(name: str, raw_arguments: Any) -> tuple[Any, str | None]:
 
 def _run_hook(tool: ToolEntry, context: ToolContext) -> tuple[str, str | None]:
     """Run a tool hook: returns the text for the model and why it failed."""
+    hook = tool.hook
+    if hook is None:
+        return f"Error: tool '{tool.name}' has no hook", "no_hook"
     try:
-        return tool.hook(context, **context.arguments), None
+        return hook(context, **context.arguments), None
     except TypeError as exc:
         return f"Error: bad arguments for '{tool.name}': {exc}", "bad_arguments"
     except Exception as exc:  # a failing tool must not abort the conversation
@@ -69,6 +74,20 @@ def _same_value(before: Any, after: Any) -> bool:
         return bool(before == after)
     except Exception:
         return False
+
+
+@dataclass
+class _Pending:
+    """A local tool call that is waiting for the client to answer it.
+
+    Only a `threading.Event` is shared with the resolving thread: no registry
+    lock and no database transaction is held while a client decides.
+    """
+
+    name: str
+    event: threading.Event
+    result: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -166,6 +185,7 @@ class HHAgent:
     model: str
     tools: dict[str, ToolEntry]
     timeout: float
+    local_timeout: float
     include_usage: bool
     verbose: bool
     on_event: EventHook | None
@@ -175,6 +195,7 @@ class HHAgent:
     _run_lock: threading.Lock
     _live_states: dict[str, dict[str, Any]]
     _state_bases: dict[str, dict[str, Any]]
+    _pending: dict[str, _Pending]
 
     @classmethod
     def root(
@@ -184,6 +205,7 @@ class HHAgent:
         model: str = DEFAULT_MODEL,
         tools: Iterable[ToolEntry] = builtin_tools,
         timeout: float = DEFAULT_TIMEOUT,
+        local_timeout: float = DEFAULT_LOCAL_TIMEOUT,
         include_usage: bool = True,
         verbose: bool = False,
         on_event: EventHook | None = None,
@@ -208,6 +230,7 @@ class HHAgent:
         self.model = model
         self.tools = {tool.name: tool for tool in tools}
         self.timeout = timeout
+        self.local_timeout = local_timeout
         self.include_usage = include_usage
         self.verbose = verbose
         self.on_event = on_event
@@ -231,6 +254,8 @@ class HHAgent:
         self._run_lock = threading.Lock()
         self._live_states = {}
         self._state_bases = {}
+        self.local_timeout = DEFAULT_LOCAL_TIMEOUT
+        self._pending = {}
         return self
 
     def fork(
@@ -262,6 +287,7 @@ class HHAgent:
         child.model = self.model
         child.tools = dict(self.tools)
         child.timeout = self.timeout
+        child.local_timeout = self.local_timeout
         child.include_usage = self.include_usage
         child.verbose = self.verbose
         child.on_event = self.on_event if on_event is None else on_event
@@ -397,6 +423,107 @@ class HHAgent:
             )
         self._live_states.clear()
         self._state_bases.clear()
+
+    def pending_calls(self) -> list[str]:
+        """Ids of local tool calls this block is waiting on right now."""
+        return sorted(self._pending)
+
+    def resolve_local_call(
+        self, call_id: str, result: str, error: str | None = None
+    ) -> bool:
+        """Hand a client's answer to the turn that is waiting for it.
+
+        Returns False when nothing is waiting on that id any more — the call
+        timed out, was cancelled, or never existed. The turn is woken by the
+        event and reads the answer on its own thread.
+        """
+        pending = self._pending.get(call_id)
+        if pending is None:
+            return False
+        pending.result = result
+        pending.error = error
+        pending.event.set()
+        return True
+
+    def _answer_local(
+        self,
+        tool: ToolEntry,
+        call_id: str,
+        arguments: dict[str, Any],
+        raw: Any,
+        hook: EventHook | None,
+        round_no: int,
+    ) -> tuple[str, str | None]:
+        """Announce a client-side tool call, then wait for the answer.
+
+        The wait holds nothing but an event: no registry lock, no database
+        transaction, no store lock. Other connections can create, run, seed and
+        evict blocks the whole time; only this turn's thread is parked.
+        """
+        pending = _Pending(name=tool.name, event=threading.Event())
+        self._pending[call_id] = pending
+        started = time.monotonic()
+        try:
+            # registered before announcing, so an answer that arrives
+            # immediately is never lost
+            self._emit(
+                hook,
+                "local_tool_called",
+                round=round_no,
+                call_id=call_id,
+                name=tool.name,
+                arguments=arguments,
+                raw_arguments=raw,
+                id=self.id,
+                timeout_ms=round(self.local_timeout * 1000, 3),
+            )
+            deadline = started + self.local_timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._emit(
+                        hook,
+                        "local_tool_unresolved",
+                        call_id=call_id,
+                        name=tool.name,
+                        reason="timeout",
+                        waited_ms=self._ms(started),
+                    )
+                    late = f"was not answered within {self.local_timeout:g}s"
+                    return (f"Error: local tool '{tool.name}' {late}", "timeout")
+                if pending.event.wait(min(0.2, remaining)):
+                    break
+                if self._cancel.is_set():
+                    self._emit(
+                        hook,
+                        "local_tool_unresolved",
+                        call_id=call_id,
+                        name=tool.name,
+                        reason="cancelled",
+                        waited_ms=self._ms(started),
+                    )
+                    raise HHAgentCancelled(
+                        f"agent {self.id} cancelled while waiting for {tool.name}"
+                    )
+            self._emit(
+                hook,
+                "local_tool_resolved",
+                call_id=call_id,
+                name=tool.name,
+                ok=pending.error is None,
+                error=pending.error,
+                result=pending.result,
+                result_chars=len(pending.result or ""),
+                waited_ms=self._ms(started),
+            )
+            if pending.error is not None:
+                return (
+                    pending.result or f"Error: local tool '{tool.name}': {pending.error}",
+                    pending.error,
+                )
+            return pending.result or "", None
+        finally:
+            self._pending.pop(call_id, None)
 
     def cancel(self) -> bool:
         """Ask the running turn to stop, returning whether one was running.
@@ -793,6 +920,11 @@ class HHAgent:
                     text, error = (
                         f"Error: arguments for '{name}' must be a JSON object",
                         "bad_arguments",
+                    )
+                elif tool.is_local:
+                    # no hook and no state on this side: the client runs it
+                    text, error = self._answer_local(
+                        tool, call_id, arguments, raw, hook, round_no
                     )
                 else:
                     context = ToolContext(

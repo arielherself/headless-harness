@@ -21,6 +21,7 @@ Commands
     get_context    {id}                                flattened message list
     get_state      {id, tool?}                         rebuilt tool state
     set_state      {id, tool, key, value?/delete?}     seed or drop a state key
+    resolve_tool   {id, call_id, result?, error?}      answer a local tool call
     list_agents    {}                                  every block, with links
     destroy_agent  {id}                                drop a block and its subtree
     ping           {echo?}
@@ -28,14 +29,22 @@ Commands
 Events
     session_hello, command_received, command_finished, error, session_closing
     agent_created, agent_forked, agent_destroyed, agents_listed, context,
-    state, state_seeded, cancel_result, pong, evicted, persist_warning
+    state, state_seeded, cancel_result, pong, evicted, persist_warning,
+    local_tool_answered
     and everything `HHAgent` emits while a block runs: turn_started,
     turn_finished, turn_failed, turn_cancelled, request_started,
     request_payload, response_received, request_finished, request_failed,
     content_delta, reasoning_delta, sse_chunk (verbose), sse_unparsed, usage,
     assistant_message, history_appended, tool_call_requested,
     tool_call_started, tool_call_finished, state_loaded, state_delta,
-    state_discarded
+    state_discarded, local_tool_called, local_tool_resolved,
+    local_tool_unresolved
+
+A block may also carry `local_tools`: tools the *client* runs. They are offered
+to the model with everything else, and when one is called the server emits
+`local_tool_called` and parks that turn until a `resolve_tool` command arrives
+with the result. The wait holds no lock and touches no database, so the rest of
+the server keeps working while a client decides.
 
 With `--db` the registry is mirrored to a SQLite file: a block is written when
 it is forked and again when its turn ends, so a process that dies mid-turn
@@ -62,6 +71,7 @@ import traceback
 from typing import Any, cast
 
 from agent import (
+    DEFAULT_LOCAL_TIMEOUT,
     DEFAULT_MODEL,
     DEFAULT_TIMEOUT,
     HHAgent,
@@ -70,7 +80,7 @@ from agent import (
     StateDelta,
 )
 from store import HHStore, HHStoreError
-from tools import builtin_tools
+from tools import ToolEntry, ToolParam, builtin_tools
 
 PROTOCOL_VERSION = 2
 DEFAULT_HOST = "127.0.0.1"
@@ -88,7 +98,9 @@ COMMANDS: list[dict[str, Any]] = [
             "key": "optional, falls back to the server default",
             "model": "optional, falls back to the server default",
             "tools": "optional list of names, defaults to every builtin",
+            "local_tools": "optional list of tool definitions the client runs",
             "timeout": "optional read timeout in seconds",
+            "local_timeout": "optional seconds to wait for a local tool answer",
             "include_usage": "optional bool, ask for token accounting",
             "verbose": "optional bool, also emit raw sse_chunk events",
         },
@@ -102,7 +114,9 @@ COMMANDS: list[dict[str, Any]] = [
             "new_id": "optional id for the new block",
             "model": "optional override inherited from the parent",
             "tools": "optional override inherited from the parent",
+            "local_tools": "optional override, replaces the inherited definitions",
             "timeout": "optional override inherited from the parent",
+            "local_timeout": "optional override inherited from the parent",
             "include_usage": "optional override inherited from the parent",
             "verbose": "optional override inherited from the parent",
         },
@@ -151,12 +165,23 @@ COMMANDS: list[dict[str, Any]] = [
             "delete": "optional bool, drop the key instead of setting it",
         },
     },
+    {
+        "command": "resolve_tool",
+        "summary": "Answer a local tool call that a turn is waiting on.",
+        "fields": {
+            "id": "required, the block whose turn is waiting",
+            "call_id": "required, from the local_tool_called event",
+            "result": "the string handed back to the model",
+            "error": "optional; marks the call failed and is reported as such",
+        },
+    },
     {"command": "ping", "summary": "Liveness probe.", "fields": {"echo": "optional"}},
 ]
 
 # Settings a fork may override on the block it creates.
-INHERITED = ("model", "timeout", "include_usage", "verbose")
+INHERITED = ("model", "timeout", "local_timeout", "include_usage", "verbose")
 BOOL_FIELDS = ("include_usage", "verbose")
+FLOAT_FIELDS = ("timeout", "local_timeout")
 
 
 class HHTcpError(Exception):
@@ -409,12 +434,19 @@ class HHServer(socketserver.ThreadingTCPServer):
                 "create_agent needs 'endpoint' and 'key', or start the server "
                 "with --endpoint/--key",
             )
+        tools = build_tools(
+            select_tools(command.get("tools")),
+            parse_local_tools(command.get("local_tools")),
+        )
         block = HHAgent.root(
             endpoint,
             key,
             model=command.get("model") or self.defaults.get("model") or DEFAULT_MODEL,
-            tools=select_tools(command.get("tools")),
-            timeout=float(command.get("timeout") or DEFAULT_TIMEOUT),
+            tools=list(tools.values()),
+            timeout=as_timeout(command.get("timeout") or DEFAULT_TIMEOUT, "timeout"),
+            local_timeout=as_timeout(
+                command.get("local_timeout") or DEFAULT_LOCAL_TIMEOUT, "local_timeout"
+            ),
             include_usage=bool(command.get("include_usage", True)),
             verbose=bool(command.get("verbose", False)),
             id=agent_id,
@@ -440,6 +472,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             include_usage=block.include_usage,
             verbose=block.verbose,
             tools=sorted(block.tools),
+            local_tools=sorted(t.name for t in block.tools.values() if t.is_local),
             tool_schemas=block.tool_schemas(),
         )
         self.persist(conn, block)
@@ -486,6 +519,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             include_usage=child.include_usage,
             verbose=child.verbose,
             tools=sorted(child.tools),
+            local_tools=sorted(t.name for t in child.tools.values() if t.is_local),
             state_namespaces=child.state_namespaces(),
         )
         self.persist(conn, child)
@@ -683,6 +717,45 @@ class HHServer(socketserver.ThreadingTCPServer):
         )
         self.persist(conn, block)
 
+    def cmd_resolve_tool(
+        self, conn: Connection, command: dict[str, Any], rid: Any
+    ) -> None:
+        """Hand a client-run tool's result to the turn that is waiting for it.
+
+        Deliberately allowed on a running block: the whole point is that a turn
+        is parked waiting for this. Nothing here blocks — resolving sets an
+        event, and the turn thread picks the answer up.
+        """
+        agent_id = require_id(command)
+        block = self.block(agent_id)
+        call_id = command.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise HHTcpError("bad_field", "'call_id' must be a non-empty string")
+        error = command.get("error")
+        if error is not None and (not isinstance(error, str) or not error):
+            raise HHTcpError("bad_field", "'error' must be a non-empty string")
+        if "result" not in command and error is None:
+            raise HHTcpError("bad_field", "resolve_tool needs 'result' or 'error'")
+        result = command.get("result")
+        if result is None:
+            result = ""
+        elif not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False, default=str)
+        if not block.resolve_local_call(call_id, result, error):
+            raise HHTcpError(
+                "unknown_call",
+                f"agent {agent_id!r} is not waiting on {call_id!r}",
+                detail={"pending": block.pending_calls()},
+            )
+        conn.send(
+            "local_tool_answered",
+            rid=rid,
+            agent_id=agent_id,
+            call_id=call_id,
+            ok=error is None,
+            result_chars=len(result),
+        )
+
     def cmd_ping(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:
         with self._registry_lock:
             total = len(self._agents)
@@ -831,6 +904,10 @@ class HHServer(socketserver.ThreadingTCPServer):
             "model": block.model,
             "tools": sorted(block.tools),
             "state_namespaces": block.state_namespaces(),
+            "local_tools": sorted(
+                t.name for t in block.tools.values() if t.is_local
+            ),
+            "waiting_on": block.pending_calls(),
             "include_usage": block.include_usage,
             "verbose": block.verbose,
             "created_at": block.created_at,
@@ -855,21 +932,28 @@ def apply_overrides(block: HHAgent, command: dict[str, Any]) -> None:
             if not isinstance(value, bool):
                 raise HHTcpError("bad_field", f"{name!r} must be a boolean")
             setattr(block, name, value)
-        elif name == "timeout":
-            try:
-                block.timeout = float(value)
-            except (TypeError, ValueError) as exc:
-                raise HHTcpError(
-                    "bad_field", f"'timeout' must be a number: {exc}"
-                ) from exc
+        elif name in FLOAT_FIELDS:
+            setattr(block, name, as_timeout(value, name))
         else:
             if not isinstance(value, str) or not value:
                 raise HHTcpError(
                     "bad_field", f"{name!r} must be a non-empty string"
                 )
             setattr(block, name, value)
+    # `tools` and `local_tools` are separate axes: whichever is supplied
+    # replaces that half, and the other half carries over untouched
+    catalogue = None
     if command.get("tools") is not None:
-        block.tools = {tool.name: tool for tool in select_tools(command["tools"])}
+        catalogue = select_tools(command["tools"])
+    local = None
+    if command.get("local_tools") is not None:
+        local = parse_local_tools(command["local_tools"])
+    if catalogue is not None or local is not None:
+        if catalogue is None:
+            catalogue = [t for t in block.tools.values() if not t.is_local]
+        if local is None:
+            local = [t for t in block.tools.values() if t.is_local]
+        block.tools = build_tools(catalogue, local)
 
 
 def namespace_for(name: str) -> str:
@@ -884,6 +968,76 @@ def namespace_for(name: str) -> str:
         if tool.name == name:
             return tool.namespace
     return name
+
+
+def as_timeout(value: Any, field: str) -> float:
+    """Coerce a timeout field, rejecting nonsense before it reaches a block."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HHTcpError("bad_field", f"{field!r} must be a number: {exc}") from exc
+    if timeout <= 0:
+        raise HHTcpError("bad_field", f"{field!r} must be positive")
+    return timeout
+
+
+def build_tools(
+    catalogue: list[ToolEntry], local: list[ToolEntry]
+) -> dict[str, ToolEntry]:
+    """Merge server-run and client-run tools, refusing name collisions."""
+    tools: dict[str, ToolEntry] = {}
+    for tool in (*catalogue, *local):
+        if tool.name in tools:
+            raise HHTcpError("bad_tools", f"tool {tool.name!r} is declared twice")
+        tools[tool.name] = tool
+    return tools
+
+
+def parse_local_tools(value: Any) -> list[ToolEntry]:
+    """Build client-run tool definitions from a `local_tools` command field.
+
+    A local tool is only a schema — name, description, parameters — because the
+    hook lives on the client. The server offers it to the model like any other
+    and asks for the result when it is called.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise HHTcpError("bad_tools", "'local_tools' must be a list of definitions")
+    parsed: list[ToolEntry] = []
+    for index, entry in enumerate(value):
+        where = f"local_tools[{index}]"
+        if not isinstance(entry, dict):
+            raise HHTcpError("bad_tools", f"{where} must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise HHTcpError("bad_tools", f"{where} needs a non-empty 'name'")
+        description = entry.get("description") or ""
+        if not isinstance(description, str):
+            raise HHTcpError("bad_tools", f"{where} 'description' must be a string")
+        params = entry.get("params") or []
+        if not isinstance(params, list):
+            raise HHTcpError("bad_tools", f"{where} 'params' must be a list")
+        declared: list[ToolParam] = []
+        for param in params:
+            if not isinstance(param, dict):
+                raise HHTcpError(
+                    "bad_tools", f"{where} has a parameter that is not an object"
+                )
+            param_name = param.get("name")
+            if not isinstance(param_name, str) or not param_name:
+                raise HHTcpError("bad_tools", f"{where} has a parameter with no 'name'")
+            declared.append(
+                ToolParam(
+                    name=param_name,
+                    type=param.get("type") or "string",
+                    description=param.get("description") or "",
+                )
+            )
+        parsed.append(
+            ToolEntry(name=name, description=description, params=declared, hook=None)
+        )
+    return parsed
 
 
 def select_tools(names: Any) -> list[Any]:

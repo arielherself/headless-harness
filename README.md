@@ -87,7 +87,7 @@ test.py         interactive client (gitignored: it holds the API key)
 docs/           this documentation
 ```
 
-## The three moving parts
+## The moving parts
 
 **Blocks form a chain.** `HHAgent.root(...)` makes an empty root;
 `block.fork(prompt)` makes a child holding that prompt. A block runs its single
@@ -105,6 +105,12 @@ by default), so tools are isolated unless they explicitly share one.
 out, every streamed text and reasoning delta, each tool call with its arguments
 and result, state commits and discards, timings and token usage. Nothing has to
 be guessed from the final text.
+
+**Some tools can live on the client.** A block may declare `local_tools`: tools
+it does not implement, only describes. The model sees them like any other, and
+when one is called the server emits `local_tool_called` and parks that turn until
+the client answers with `resolve_tool`. The wait holds no lock and no database
+transaction, so the rest of the server keeps working while a client decides.
 
 ## Requirements
 

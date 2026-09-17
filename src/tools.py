@@ -18,6 +18,11 @@ class ToolParam:
 class ToolEntry:
     """A tool the model may call: its schema plus the hook that runs it.
 
+    A tool with no `hook` runs on the *client*: the server cannot execute it, so
+    it announces the call and waits for an answer instead (see `local_tools` on
+    `create_agent` and the `resolve_tool` command). Local tools are visible to
+    the model exactly like any other, but they carry no state on the server.
+
     `state_namespace` is where the tool's state lives. Left empty, every tool
     gets a private namespace named after itself; tools that should share one
     memory — a get/set pair, say — declare the same `state_namespace`.
@@ -26,8 +31,13 @@ class ToolEntry:
     name: str
     description: str
     params: list[ToolParam]
-    hook: Callable[..., str]
+    hook: Callable[..., str] | None = None
     state_namespace: str = ""
+
+    @property
+    def is_local(self) -> bool:
+        """Whether the client answers this tool instead of a server-side hook."""
+        return self.hook is None
 
     @property
     def namespace(self) -> str:

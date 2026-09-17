@@ -108,7 +108,46 @@ Equality during the diff is guarded (`_same_value`): a comparison that cannot be
 reduced to a bool, as with a numpy array, counts as changed. A delta may then be
 a superset, never a wrong one.
 
-## 5. Persistence
+## 5. Local tools
+
+A block may also carry `local_tools`: tools the **client** implements. Only the
+schema travels — name, description, parameters — because the hook is on the
+client's side, and the model sees them in the same `tools` array as everything
+else. `ToolEntry.hook is None` is what marks one.
+
+When the model calls one, nothing is executed here. The harness emits
+`local_tool_called` and parks that turn's thread until a `resolve_tool` command
+brings the result, which then becomes the tool message fed back to the model —
+indistinguishable, from the model's point of view, from a server-side tool.
+
+**The wait holds nothing.** It is one `threading.Event` and a deadline: no
+registry lock, no store lock, no open SQLite transaction while a client decides.
+Other connections can create, fork, run, seed and evict blocks the whole time,
+and the database is written throughout. The tests assert this directly — both
+locks acquirable, `_db.in_transaction` false, and a write committing mid-park —
+rather than inferring it from things being fast.
+
+Three consequences worth stating:
+
+- **A local tool has no state on the server.** `ToolContext.state` lives here, so
+  a client-run tool cannot use it; whatever memory it needs is the client's own.
+  It follows that forking rewinds builtin state but cannot rewind a client's
+  private memory.
+- **A slow client only hurts its own turn.** Other turns, other connections and
+  the database are untouched; the parked turn simply occupies one thread.
+- **Definitions are persisted, pending calls are not.** A turn is only written
+  when it ends, so a process that dies while a client is thinking loses that turn
+  — exactly as it would lose one that died mid-request. The definitions are
+  stored whole (unlike builtin tools, which are stored by name), so a restarted
+  server still offers the tool and can ask again.
+
+**A timeout is not a failure.** With no answer inside `local_timeout`, the tool
+result becomes an explanatory error string and the turn carries on, so the model
+can react just as it would to a tool that raised. `local_tool_unresolved` reports
+the reason (`timeout`, `cancelled`), and `cancel` releases a parked turn like any
+other.
+
+## 6. Persistence
 
 `HHStore` mirrors the registry into SQLite. Per block it stores identity and
 linkage, the conversation the block owns, its state deltas, its lifecycle flags
@@ -140,7 +179,7 @@ the event, so killing the server the instant a turn completed dropped it.
 `ON DELETE CASCADE`, so removing a subtree cannot leave an orphan — and a
 config of `PRAGMA foreign_keys = ON` is set per connection.
 
-## 6. Eviction
+## 7. Eviction
 
 The file has a budget (`--max-db-bytes`, default 64 MiB, `0` disables). After
 every write the size is measured and whole subtrees are evicted until it fits.
@@ -172,7 +211,7 @@ Two limits worth knowing: SQLite's own schema occupies ~24 KiB, so a budget belo
 that can never be met (the loop empties the store and stops); and eviction only
 runs after a write, so an over-budget file stays that way until the next one.
 
-## 7. Concurrency
+## 8. Concurrency
 
 Threaded, with a few deliberate serialisation points.
 
@@ -206,7 +245,7 @@ client was told nothing, and the client waits forever. This was a real bug; the
 fix is the shared hold, and the test that catches it injects a delay into `save`
 and evicts in the middle.
 
-## 8. Known limits and open work
+## 9. Known limits and open work
 
 - **Context grows with the chain.** Nothing is trimmed, summarised or capped, so
   the request body grows linearly with depth. Tool state is deliberately exempt:

@@ -58,6 +58,7 @@ Two exceptions, both worth internalising:
 | `get_context` | the flattened message list of a chain |
 | `get_state` | a block's rebuilt tool state |
 | `set_state` | seed or drop one key of a block's state |
+| `resolve_tool` | answer a local tool call a turn is waiting on |
 | `list_agents` | every block, with links and flags |
 | `destroy_agent` | drop a block and everything forked from it |
 | `ping` | liveness, counters, store stats |
@@ -74,12 +75,15 @@ never dirty.
 | `key` | optional; falls back to the server default |
 | `model` | optional; falls back to the server default |
 | `tools` | optional list of names; omitted means every builtin |
+| `local_tools` | optional definitions of tools the **client** runs (see below) |
 | `timeout` | optional read timeout in seconds |
+| `local_timeout` | optional seconds to wait for a local tool to be answered (default 120) |
 | `include_usage` | optional bool; asks the provider for token accounting |
 | `verbose` | optional bool; additionally emits raw `sse_chunk` events |
 
 → `agent_created` (`agent_id`, `parent: null`, `depth: 0`, `dirty`, `model`,
-`endpoint`, `timeout`, `include_usage`, `verbose`, `tools`, `tool_schemas`).
+`endpoint`, `timeout`, `include_usage`, `verbose`, `tools`, `local_tools`,
+`tool_schemas`).
 
 Errors: `bad_id`, `missing_credentials`, `duplicate_agent`, `unknown_tool`,
 `bad_tools`, `bad_field`.
@@ -94,11 +98,15 @@ endpoint, key, model, tools and options, and **starts dirty**.
 | `id` | **required** — the parent to fork from |
 | `prompt` | **required** — non-empty string |
 | `new_id` | optional id for the new block; supply it to avoid waiting for the reply |
-| `model` `tools` `timeout` `include_usage` `verbose` | optional overrides for the child only |
+| `model` `tools` `local_tools` `timeout` `local_timeout` `include_usage` `verbose` | optional overrides for the child only |
+
+`tools` and `local_tools` are separate axes: supplying either replaces that half
+and carries the other half over, so a fork can add a local tool without losing
+the inherited builtins.
 
 → `agent_forked` (`agent_id`, `parent`, `depth`, `dirty`, `prompt`,
 `prompt_chars`, `path` (ids root → child), `context_len`, `model`, `timeout`,
-`include_usage`, `verbose`, `tools`, `state_namespaces`).
+`include_usage`, `verbose`, `tools`, `local_tools`, `state_namespaces`).
 
 Errors: `bad_id`, `bad_prompt`, `unknown_agent`, `parent_dirty`,
 `duplicate_agent`, `unknown_tool`, `bad_field`.
@@ -182,8 +190,8 @@ No fields. → `agents_listed` (`count`, `roots`, `dirty` — ids currently dirt
 
 Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `error`,
 `prompt_chars`, `prompt_preview`, `text_chars`, `local_len`, `context_len`,
-`model`, `tools`, `state_namespaces`, `include_usage`, `verbose`, `created_at`,
-`age_ms`.
+`model`, `tools`, `local_tools`, `state_namespaces`, `waiting_on` (local calls
+this block is parked on), `include_usage`, `verbose`, `created_at`, `age_ms`.
 
 ### `destroy_agent`
 
@@ -197,6 +205,25 @@ cancelled. → `agent_destroyed` (`agent_id`, `dropped` — every id removed, `c
 `cancelled` — ids whose turn was running, `age_ms`, `remaining`).
 
 Errors: `bad_id`, `unknown_agent`.
+
+### `resolve_tool`
+
+Answers a local tool call that a turn is parked on. **Deliberately allowed on a
+running block**, unlike `set_state`: the block being parked is the whole point.
+
+| Field | Notes |
+|---|---|
+| `id` | **required** — the block whose turn is waiting, from the event |
+| `call_id` | **required** — from the `local_tool_called` event |
+| `result` | the string handed back to the model; a non-string is JSON-encoded |
+| `error` | optional; marks the call failed and is reported to the model as such |
+
+→ `local_tool_answered` (`call_id`, `ok`, `result_chars`), and the parked turn
+resumes.
+
+Errors: `bad_id`, `unknown_agent`, `bad_field`, `unknown_call` — nothing is
+waiting on that id any more (it timed out, was cancelled, or never existed), and
+`detail.pending` lists what is still outstanding.
 
 ### `ping`
 
@@ -235,6 +262,7 @@ unreadable row).
 | `context` | see the command above |
 | `state` | see the command above |
 | `state_seeded` | see the command above |
+| `local_tool_answered` | `rid`, `agent_id`, `call_id`, `ok`, `result_chars` |
 | `pong` | see the command above |
 | `error` | `code`, `message`, `rid`, `command`, plus a case-specific `detail`; `internal_error` adds `traceback`, `bad_json` adds `line`, `command_too_large` adds `bytes`, `unknown_command` adds `commands` |
 
@@ -280,9 +308,18 @@ requests tools is followed by another round until the model answers with text.
 | `tool_call_started` | `round`, `call_id`, `name` |
 | `tool_call_finished` | `round`, `call_id`, `name`, `ok`, `error`, `result`, `result_chars`, `elapsed_ms` |
 
-`error` is a code, not a message: `unknown_tool`, `bad_arguments`, or
-`tool_raised`. A tool that fails still produces a result, which is fed back to
-the model so it can correct itself.
+`error` is a code, not a message: `unknown_tool`, `bad_arguments`, `tool_raised`,
+`timeout`, or `no_hook`. A tool that fails still produces a result, which is fed
+back to the model so it can correct itself.
+
+Calls to a **local tool** — one this client declared — announce themselves
+instead of running:
+
+| Event | Fields |
+|---|---|
+| `local_tool_called` | `round`, `call_id`, `name`, `arguments`, `raw_arguments`, `timeout_ms` — the turn is now parked on this |
+| `local_tool_resolved` | `call_id`, `name`, `ok`, `error`, `result`, `result_chars`, `waited_ms` |
+| `local_tool_unresolved` | `call_id`, `name`, `reason` (`timeout` / `cancelled`), `waited_ms` |
 
 ### State
 
@@ -299,6 +336,46 @@ the model so it can correct itself.
 | `evicted` | `agent_id` (the subtree's root), `dropped`, `nodes`, `newest`, `bytes`, `max_bytes` |
 | `persist_warning` | `agent_id`, `dropped_tools`, `message` — state that could not be stored |
 
+## Local tools
+
+A block may declare tools the **client** runs. Only a schema travels — name,
+description, parameters — because the implementation is on the client's side, and
+the model sees it in the same `tools` array as the builtins.
+
+```jsonc
+{"command":"create_agent","id":"root","local_tools":[
+  {"name":"ask_operator","description":"Ask the human operator.",
+   "params":[{"name":"question","type":"string","description":"what to ask"}]}
+]}
+```
+
+They inherit through `fork` (pass `local_tools` to replace the set), are reported
+as `local_tools` by `agent_created`, `agent_forked` and `list_agents`, and survive
+a restart because the definitions are stored whole.
+
+When the model calls one, the turn parks and the client is asked:
+
+```
+← {"event":"tool_call_requested","name":"ask_operator","raw_arguments":"{\"question\":\"今天午饭吃什么？\"}"}
+← {"event":"local_tool_called","agent_id":"a1","call_id":"call_1","name":"ask_operator",
+   "arguments":{"question":"今天午饭吃什么？"},"timeout_ms":120000}
+→ {"command":"resolve_tool","id":"a1","call_id":"call_1","result":"红烧肉"}
+← {"event":"local_tool_answered","call_id":"call_1","ok":true,"result_chars":9}
+← {"event":"local_tool_resolved","call_id":"call_1","name":"ask_operator","ok":true,"waited_ms":401}
+← {"event":"tool_call_finished","name":"ask_operator","ok":true,"result":"红烧肉"}
+```
+
+Things to know:
+
+- **Only that one turn is parked.** The wait holds no lock and no database
+  transaction, so other connections keep being served normally, writes included.
+- **The answer is addressed by `agent_id` and `call_id`**, both from the
+  `local_tool_called` event — the block owns the pending call.
+- **Local tools have no server-side state.** `ToolContext.state` lives on the
+  server, so such a tool keeps its own memory; forking rewinds builtin state but
+  not a client's private memory.
+- **`cancel` releases a parked turn**, reporting `reason: "cancelled"`.
+
 ## Error codes
 
 | Code | Meaning |
@@ -310,8 +387,9 @@ the model so it can correct itself.
 | `bad_id` | `id` / `new_id` missing or not a non-empty string |
 | `bad_prompt` | `prompt` missing or empty |
 | `bad_field` | a field had the wrong type or value |
-| `bad_tools` | `tools` was not a list |
+| `bad_tools` | `tools` / `local_tools` was malformed, or a name is declared twice |
 | `unknown_tool` | a name is not in the catalogue |
+| `unknown_call` | `resolve_tool` for a call nothing is waiting on |
 | `unknown_agent` | no such block; `detail.agents` lists what exists |
 | `duplicate_agent` | that id is taken |
 | `missing_credentials` | no endpoint/key on the command and no server default |
@@ -341,6 +419,11 @@ namespace, so state stays reachable after a tool is removed.
 
 **The database budget is soft.** A subtree with a turn in flight is skipped, so
 the file can exceed `--max-db-bytes` until that turn ends.
+
+**Local tools park one turn and nothing else.** While a client is deciding, no
+lock and no database transaction is held, so every connection stays fully
+serviceable — writes included. A call with no answer inside `local_timeout` does
+not fail the turn; the model is told the tool produced an error and can react.
 
 **Durability precedes the completion event.** When you see a turn's
 `command_finished`, its result is already on disk if the server was started with

@@ -143,6 +143,43 @@ Do not signal failure by raising for control flow; return a string the model can
 act on. Either way the turn continues — a failing tool never aborts a
 conversation.
 
+## Tools that run on the client
+
+Not every tool belongs on the server. A tool with no `hook` is a **local
+tool**: the server offers it to the model but cannot run it, so it parks the turn
+and asks the client for the result.
+
+Local tools are declared per block over the protocol rather than in this module,
+because their implementation is somewhere else entirely:
+
+```jsonc
+{"command":"create_agent","id":"root","local_tools":[
+  {"name":"ask_operator","description":"Ask the human operator.",
+   "params":[{"name":"question","type":"string","description":"what to ask"}]}
+]}
+```
+
+The model sees them exactly like a builtin. When one is called the server emits
+`local_tool_called` and waits for a `resolve_tool` command with the result, which
+becomes the tool message on the next request. In the library, that wait is
+`HHAgent.resolve_local_call(call_id, result, error=None)`, called from whatever
+thread can answer.
+
+`ToolEntry(name=..., description=..., params=..., hook=None)` builds one in code;
+`tool.is_local` is true for it. The rest of this document applies as usual, with
+two exceptions:
+
+- **No state.** `ToolContext` exists on the server, so a local tool cannot use
+  `state`. Keep whatever memory it needs on your own side — and note that forking
+  rewinds server-side state but cannot rewind yours.
+- **A timeout is not a failure.** If no answer arrives within the block's
+  `local_timeout`, the tool result becomes an explanatory error string and the
+  turn continues, so the model can react as it would to any other failing tool.
+
+Nothing else is blocked while the client decides: no lock, no database
+transaction. See [`design.md`](design.md) for why that is guaranteed rather than
+lucky.
+
 ## The builtin tools
 
 | Tool | Namespace | What it does |

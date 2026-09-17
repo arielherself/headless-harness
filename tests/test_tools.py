@@ -1,9 +1,13 @@
 """Tests for `src/tools.py`: the tool schema, its state rules and the builtins."""
 
+import os
 import re
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest import mock
+
+import requests
 
 from tests.support import tools
 
@@ -59,10 +63,16 @@ class ToolContextTests(unittest.TestCase):
 
 
 class BuiltinToolTests(unittest.TestCase):
-    def test_the_catalogue_is_the_four_builtins(self):
+    def test_the_catalogue_is_the_five_builtins(self):
         self.assertEqual(
             [tool.name for tool in tools.builtin_tools],
-            ["get_system_info", "get_current_time", "set_magic_number", "get_magic_number"],
+            [
+                "get_system_info",
+                "get_current_time",
+                "set_magic_number",
+                "get_magic_number",
+                "web_fetch",
+            ],
         )
 
     def test_the_system_info_tool_reports_the_model_in_use(self):
@@ -187,6 +197,80 @@ class BuiltinToolTests(unittest.TestCase):
             self.assertFalse(tool.has_rollback)
             self.assertFalse(tool.is_local)
             self.assertTrue(tool.description)
+
+
+class WebFetchToolTests(unittest.TestCase):
+    """`web_fetch` reads through Jina's reader, so the HTTP call is stubbed here."""
+
+    def call(self, **arguments):
+        """Call the hook the way the harness does: `hook(context, **arguments)`."""
+        context = tools.ToolContext(
+            tool=tools.web_fetch_tool,
+            agent=None,
+            call_id="c",
+            arguments=arguments,
+            raw_arguments="{}",
+            state={},
+        )
+        return tools.web_fetch_executor(context, **context.arguments)
+
+    def test_it_says_the_answer_comes_back_as_markdown(self):
+        description = tools.web_fetch_tool.description
+        self.assertIn("Markdown", description)
+        self.assertIn("Jina", description)
+
+    def test_it_reads_through_the_jina_reader(self):
+        response = mock.Mock(ok=True, status_code=200, content=b"# Title\n\nbody")
+        with mock.patch("requests.get", return_value=response) as get:
+            text = self.call(url="example.com/docs")
+        self.assertEqual(text, "# Title\n\nbody")
+        self.assertEqual(get.call_args.args[0], "https://r.jina.ai/https://example.com/docs")
+        self.assertEqual(get.call_args.kwargs["headers"]["X-Return-Format"], "markdown")
+        self.assertEqual(get.call_args.kwargs["timeout"], tools.WEB_FETCH_TIMEOUT)
+
+    def test_a_url_that_already_has_a_scheme_is_left_alone(self):
+        response = mock.Mock(ok=True, status_code=200, content=b"x")
+        with mock.patch("requests.get", return_value=response) as get:
+            self.call(url="http://example.com")
+        self.assertEqual(get.call_args.args[0], "https://r.jina.ai/http://example.com")
+
+    def test_the_key_goes_out_when_the_environment_has_one(self):
+        response = mock.Mock(ok=True, status_code=200, content=b"x")
+        with mock.patch("requests.get", return_value=response) as get, mock.patch.dict(
+            os.environ, {"JINA_API_KEY": "jina_k"}
+        ):
+            self.call(url="https://example.com")
+        self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer jina_k")
+
+    def test_an_http_error_is_reported_to_the_model(self):
+        response = mock.Mock(
+            ok=False, status_code=429, content=b"slow down", reason="Too Many Requests"
+        )
+        with mock.patch("requests.get", return_value=response):
+            text = self.call(url="https://example.com")
+        self.assertIn("429", text)
+        self.assertIn("slow down", text)
+
+    def test_a_dead_network_is_reported_to_the_model(self):
+        with mock.patch("requests.get", side_effect=requests.ConnectionError("no route")):
+            text = self.call(url="https://example.com")
+        self.assertTrue(text.startswith("Error"))
+        self.assertIn("no route", text)
+
+    def test_an_empty_document_is_reported_to_the_model(self):
+        response = mock.Mock(ok=True, status_code=200, content=b"   \n")
+        with mock.patch("requests.get", return_value=response):
+            text = self.call(url="https://example.com")
+        self.assertIn("empty", text)
+
+    def test_a_huge_page_is_truncated(self):
+        response = mock.Mock(
+            ok=True, status_code=200, content=b"y" * (tools.WEB_FETCH_MAX_CHARS + 500)
+        )
+        with mock.patch("requests.get", return_value=response):
+            text = self.call(url="https://example.com")
+        self.assertIn("truncated", text)
+        self.assertLess(len(text), tools.WEB_FETCH_MAX_CHARS + 200)
 
 
 if __name__ == "__main__":

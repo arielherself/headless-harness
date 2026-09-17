@@ -263,11 +263,21 @@ lucky.
 | `get_current_time` | `get_current_time` | reports UTC and local time |
 | `set_magic_number` | `magic` | stores a number in the shared `magic` namespace |
 | `get_magic_number` | `magic` | reads it back |
+| `web_fetch` | `web_fetch` | reads a URL through Jina's reader and returns Jina's Markdown of the page |
 
 The `magic` pair is the worked example of a shared namespace, and the pair used to
 test that forking rewinds state. Before they declared `state_namespace="magic"`
 they could not see each other's writes at all — which is the isolation default
 working as intended.
+
+`web_fetch` reads a page through Jina's reader (`r.jina.ai`), so the URL leaves
+the host and what comes back is Jina's extraction of the page as Markdown — the
+main content rendered and condensed, not the raw HTML. It is a read: the request
+leaves nothing behind that a later turn would have to trip over, so it declares no
+external effects and a failed turn says nothing about it. Set `JINA_API_KEY` in the
+server's environment to authenticate the call; without it Jina rate-limits the
+caller by IP. A page longer than `WEB_FETCH_MAX_CHARS` (20 000 characters) comes
+back truncated with a note saying how much was cut.
 
 ## Checklist
 

@@ -134,7 +134,13 @@ class SessionTests(ServerTestCase):
         )
         self.assertEqual(
             [tool["name"] for tool in hello["tools"]],
-            ["get_system_info", "get_current_time", "set_magic_number", "get_magic_number"],
+            [
+                "get_system_info",
+                "get_current_time",
+                "set_magic_number",
+                "get_magic_number",
+                "web_fetch",
+            ],
         )
         setter = hello["tools"][2]
         self.assertEqual(setter["state_namespace"], "magic")
@@ -349,9 +355,15 @@ class CreateAgentTests(ServerTestCase):
         self.assertEqual(created["local_tools"], [])
         self.assertEqual(
             sorted(created["tools"]),
-            ["get_current_time", "get_magic_number", "get_system_info", "set_magic_number"],
+            [
+                "get_current_time",
+                "get_magic_number",
+                "get_system_info",
+                "set_magic_number",
+                "web_fetch",
+            ],
         )
-        self.assertEqual(len(created["tool_schemas"]), 4)
+        self.assertEqual(len(created["tool_schemas"]), 5)
 
     def test_an_id_is_generated_when_omitted(self):
         fixture = self.start_server()
@@ -546,7 +558,13 @@ class ForkTests(ServerTestCase):
         self.assertFalse(forked["verbose"])
         self.assertEqual(
             sorted(forked["tools"]),
-            ["get_current_time", "get_magic_number", "get_system_info", "set_magic_number"],
+            [
+                "get_current_time",
+                "get_magic_number",
+                "get_system_info",
+                "set_magic_number",
+                "web_fetch",
+            ],
         )
         self.assertEqual(forked["local_tools"], [])
         self.assertEqual(forked["state_namespaces"], [])

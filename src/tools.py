@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import requests
+
 from protocol import PROTOCOL_VERSION
 
 if TYPE_CHECKING:  # only for the annotation below; agent imports this module
@@ -175,9 +177,72 @@ get_magic_number_tool = ToolEntry(
     state_namespace="magic",
 )
 
+# Jina's reader renders a URL as Markdown for a model to read. An API key is
+# optional — it lifts the anonymous rate limit — so it is read from the
+# environment when the operator has one.
+JINA_READER = "https://r.jina.ai/"
+WEB_FETCH_TIMEOUT = 180.0
+# a tool result stays in the transcript of every later request, so a huge page is
+# cut off rather than carried forever
+WEB_FETCH_MAX_CHARS = 20_000
+
+
+def web_fetch_executor(context: ToolContext, url: str) -> str:
+    target = url.strip()
+    if "://" not in target:
+        target = f"https://{target}"
+    headers = {"Accept": "text/plain", "X-Return-Format": "markdown"}
+    key = os.environ.get("JINA_API_KEY")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        response = requests.get(
+            f"{JINA_READER}{target}", headers=headers, timeout=WEB_FETCH_TIMEOUT
+        )
+    except requests.RequestException as exc:
+        return f"Error: could not reach Jina Reader: {exc}"
+    text = response.content.decode("utf-8", "replace").strip()
+    if not response.ok:
+        detail = " ".join(text.split())[:200] or response.reason
+        return f"Error: Jina Reader answered HTTP {response.status_code}: {detail}"
+    if not text:
+        return "Error: Jina Reader returned an empty document."
+    if len(text) > WEB_FETCH_MAX_CHARS:
+        return (
+            f"{text[:WEB_FETCH_MAX_CHARS]}\n\n"
+            f"[truncated: showing the first {WEB_FETCH_MAX_CHARS} of {len(text)} characters]"
+        )
+    return text
+
+
+web_fetch_tool = ToolEntry(
+    name="web_fetch",
+    description=(
+        "Read a web page as Markdown, through Jina AI's reader (r.jina.ai). What "
+        "comes back is Jina's extraction of the page — its main content rendered "
+        "and condensed as Markdown, not the raw HTML — so scripts, styles, "
+        "navigation and anything Jina cannot render are missing. Use it to read "
+        "documentation, articles and API references; it cannot reach pages behind "
+        "a login, and it is not a search engine."
+    ),
+    params=[
+        ToolParam(
+            name="url",
+            type="string",
+            description="the page to read, e.g. https://example.com/docs",
+        )
+    ],
+    hook=web_fetch_executor,
+    # it reads: the request changes nothing a later turn would have to be warned
+    # about, so no external effect is declared and a failed turn stays quiet
+    external_effects=False,
+)
+
+
 builtin_tools = [
     get_system_info_tool,
     get_current_time_tool,
     set_magic_number_tool,
     get_magic_number_tool,
+    web_fetch_tool,
 ]

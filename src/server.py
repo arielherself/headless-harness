@@ -19,6 +19,8 @@ Commands
     run            {id}                                executes a block's turn
     cancel         {id}                                stop a running turn
     get_context    {id}                                flattened message list
+    get_state      {id, tool?}                         rebuilt tool state
+    set_state      {id, tool, key, value?/delete?}     seed or drop a state key
     list_agents    {}                                  every block, with links
     destroy_agent  {id}                                drop a block and its subtree
     ping           {echo?}
@@ -26,13 +28,14 @@ Commands
 Events
     session_hello, command_received, command_finished, error, session_closing
     agent_created, agent_forked, agent_destroyed, agents_listed, context,
-    cancel_result, pong
+    state, state_seeded, cancel_result, pong
     and everything `HHAgent` emits while a block runs: turn_started,
     turn_finished, turn_failed, turn_cancelled, request_started,
     request_payload, response_received, request_finished, request_failed,
     content_delta, reasoning_delta, sse_chunk (verbose), sse_unparsed, usage,
     assistant_message, history_appended, tool_call_requested,
-    tool_call_started, tool_call_finished
+    tool_call_started, tool_call_finished, state_loaded, state_delta,
+    state_discarded
 
 Run it with `python src/server.py`, then talk to it, e.g.
 
@@ -55,6 +58,7 @@ from agent import (
     HHAgent,
     HHAgentCancelled,
     HHAgentError,
+    StateDelta,
 )
 from tools import builtin_tools
 
@@ -116,6 +120,25 @@ COMMANDS: list[dict[str, Any]] = [
         "command": "destroy_agent",
         "summary": "Drop a block and everything forked from it.",
         "fields": {"id": "required"},
+    },
+    {
+        "command": "get_state",
+        "summary": "Return a block's rebuilt tool state.",
+        "fields": {
+            "id": "required",
+            "tool": "optional tool name; omit for every touched tool",
+        },
+    },
+    {
+        "command": "set_state",
+        "summary": "Seed or drop one key of a block's own state deltas.",
+        "fields": {
+            "id": "required, a block that is neither running nor dirty",
+            "tool": "required tool name",
+            "key": "required top-level state key",
+            "value": "required unless 'delete' is true",
+            "delete": "optional bool, drop the key instead of setting it",
+        },
     },
     {"command": "ping", "summary": "Liveness probe.", "fields": {"echo": "optional"}},
 ]
@@ -427,6 +450,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             include_usage=child.include_usage,
             verbose=child.verbose,
             tools=sorted(child.tools),
+            state_tools=child.state_tools(),
         )
 
     def cmd_run(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:
@@ -539,6 +563,80 @@ class HHServer(socketserver.ThreadingTCPServer):
             remaining=len(self._agents),
         )
 
+    def cmd_get_state(
+        self, conn: Connection, command: dict[str, Any], rid: Any
+    ) -> None:
+        agent_id = require_id(command)
+        block = self.block(agent_id)
+        tool = command.get("tool")
+        if tool is not None and (not isinstance(tool, str) or not tool):
+            raise HHTcpError("bad_field", "'tool' must be a non-empty string")
+        names = [tool] if tool else block.state_tools()
+        conn.send(
+            "state",
+            rid=rid,
+            agent_id=agent_id,
+            depth=block.depth,
+            path=block.path(),
+            tools=names,
+            state={name: block.merged_state(name) for name in names},
+        )
+
+    def cmd_set_state(
+        self, conn: Connection, command: dict[str, Any], rid: Any
+    ) -> None:
+        """Seed a block's own deltas. Only a finished block may be written to.
+
+        A running block would race the turn, and a dirty one would need the seed
+        folded into the turn's own diff at commit time. Seeding a finished block
+        — a root, typically — is enough to give a whole subtree initial state.
+        """
+        agent_id = require_id(command)
+        block = self.block(agent_id)
+        if block.running:
+            raise HHTcpError(
+                "agent_running", f"agent {agent_id!r} is mid-turn; cancel it first"
+            )
+        if block.dirty:
+            raise HHTcpError(
+                "agent_dirty",
+                f"agent {agent_id!r} has not run yet; seed the block it forked from",
+            )
+        tool = command.get("tool")
+        if not isinstance(tool, str) or not tool:
+            raise HHTcpError("bad_field", "'tool' must be a non-empty string")
+        key = command.get("key")
+        if not isinstance(key, str) or not key:
+            raise HHTcpError("bad_field", "'key' must be a non-empty string")
+        drop = bool(command.get("delete", False))
+        if not drop and "value" not in command:
+            raise HHTcpError("bad_field", "set_state needs 'value', or 'delete': true")
+        replaced = key in block.merged_state(tool)
+        delta = block.state_deltas.get(tool)
+        if delta is None:
+            delta = StateDelta()
+            block.state_deltas[tool] = delta
+        if drop:
+            delta.changed.pop(key, None)
+            if key not in delta.removed:
+                delta.removed = (*delta.removed, key)
+        else:
+            delta.changed[key] = command["value"]
+            delta.removed = tuple(name for name in delta.removed if name != key)
+        if not delta.changed and not delta.removed:
+            del block.state_deltas[tool]
+        conn.send(
+            "state_seeded",
+            rid=rid,
+            agent_id=agent_id,
+            tool=tool,
+            key=key,
+            value=command.get("value"),
+            deleted=drop,
+            replaced=replaced,
+            keys=sorted(block.merged_state(tool)),
+        )
+
     def cmd_ping(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:
         with self._registry_lock:
             total = len(self._agents)
@@ -583,6 +681,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             dirty=block.dirty,
             messages=len(block.messages),
             context_len=len(block.context()),
+            state_committed=sorted(block.state_deltas),
         )
 
     def block(self, agent_id: str) -> HHAgent:
@@ -611,6 +710,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             "context_len": len(block.context()),
             "model": block.model,
             "tools": sorted(block.tools),
+            "state_tools": block.state_tools(),
             "include_usage": block.include_usage,
             "verbose": block.verbose,
             "created_at": block.created_at,

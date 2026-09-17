@@ -39,3 +39,18 @@ Where to look today: `request_started.messages` (count), `request_payload`
   stay stable within a turn or the model sees the context shift mid-turn.
 - A context that references tool calls while `tools` is absent must keep working;
   the empty-`tools` case is already handled and the provider accepts it.
+
+### Tool state is deliberately never trimmed
+
+Settled, not open: any future budget applies to `messages` only and must leave
+`HHAgent.state_deltas` alone. Tool state is not LLM-facing — it never enters the
+request payload; only `messages` and the tool schemas do — so it is an
+environment, not a transcript. Trimming it would corrupt the one thing the
+chain exists to reproduce faithfully.
+
+The accepted cost sits on the other side: a trimmed-away message may be the only
+place a state change is *explained*, so the model can lose the memory of doing
+something whose effect is still present in the environment. Two practical
+consequences: a tool should describe its effects in its own result text, and a
+caller must not assume the model remembers a change just because the state still
+shows it.

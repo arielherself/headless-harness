@@ -1,3 +1,4 @@
+import copy
 import json
 import threading
 import time
@@ -8,7 +9,7 @@ from typing import Any, Self
 
 import requests
 
-from tools import ToolEntry, builtin_tools
+from tools import ToolContext, ToolEntry, builtin_tools
 
 # Must be a model the provider serves over the OpenAI chat/completions shape;
 # the `claude-*` models are rejected here and only accept /v1/messages.
@@ -31,6 +32,43 @@ class HHAgentCancelled(HHAgentError):
 def new_id() -> str:
     """A short, collision-resistant block id."""
     return f"agent-{uuid.uuid4().hex[:12]}"
+
+
+def _parse_arguments(name: str, raw_arguments: Any) -> tuple[Any, str | None]:
+    """Decode a tool call's arguments, or explain why they are unusable."""
+    if isinstance(raw_arguments, str):
+        try:
+            return (json.loads(raw_arguments) if raw_arguments.strip() else {}), None
+        except json.JSONDecodeError as exc:
+            return None, f"Error: arguments for '{name}' are not valid JSON: {exc}"
+    if isinstance(raw_arguments, dict):
+        return raw_arguments, None
+    return {}, None
+
+
+def _run_hook(tool: ToolEntry, context: ToolContext) -> tuple[str, str | None]:
+    """Run a tool hook: returns the text for the model and why it failed."""
+    try:
+        return tool.hook(context, **context.arguments), None
+    except TypeError as exc:
+        return f"Error: bad arguments for '{tool.name}': {exc}", "bad_arguments"
+    except Exception as exc:  # a failing tool must not abort the conversation
+        return (
+            f"Error: tool '{tool.name}' raised {type(exc).__name__}: {exc}",
+            "tool_raised",
+        )
+
+
+def _same_value(before: Any, after: Any) -> bool:
+    """Equality that never raises and never returns a non-bool.
+
+    Exotic values (a numpy array, say) compare to something without a truth
+    value; calling those changed only ever makes a delta a superset.
+    """
+    try:
+        return bool(before == after)
+    except Exception:
+        return False
 
 
 @dataclass
@@ -80,6 +118,19 @@ class _Turn:
         return message
 
 
+@dataclass
+class StateDelta:
+    """One block's contribution to a tool's persistent state.
+
+    Granularity is the top-level key: whatever a tool did to `state["packages"]`
+    is recorded as the new value of `packages`, which keeps nested edits (an
+    in-place `append`, say) correct without having to track every write.
+    """
+
+    changed: dict[str, Any] = field(default_factory=dict)
+    removed: tuple[str, ...] = ()
+
+
 class HHAgent:
     """One block of a conversation chain.
 
@@ -87,11 +138,19 @@ class HHAgent:
     reply to it. Blocks are linked through `parent`, so the conversation is a
     singly linked list and the context sent to the provider is `context()`,
     rebuilt by walking to the root. Forking stores a prompt and a pointer and
-    copies nothing else, which is safe because tools carry no state.
+    copies nothing else.
+
+    Tool state has the same shape: a block keeps only the deltas its own turn
+    committed, under `state_deltas`, and a tool's live state is `tool_state()`,
+    the chain's deltas replayed in order. Forking a block therefore rewinds
+    every tool's memory to that point, and because a chain is linear there is
+    never anything to merge.
 
     A block runs its single turn exactly once: `fork` marks it `dirty`, and the
     turn clears that flag when it ends, however it ends. Forking from a dirty
-    block is refused, since its context is still growing.
+    block is refused, since its context is still growing. Only a turn that
+    finished commits state deltas, so a tool's memory never advances through a
+    failure, a cancellation, or an abandoned generator.
     """
 
     id: str
@@ -110,8 +169,11 @@ class HHAgent:
     include_usage: bool
     verbose: bool
     on_event: EventHook | None
+    state_deltas: dict[str, StateDelta]
     _cancel: threading.Event
     _run_lock: threading.Lock
+    _live_states: dict[str, dict[str, Any]]
+    _state_bases: dict[str, dict[str, Any]]
 
     @classmethod
     def root(
@@ -163,8 +225,11 @@ class HHAgent:
         self.dirty = False
         self.created_at = time.time()
         self.on_event = None
+        self.state_deltas = {}
         self._cancel = threading.Event()
         self._run_lock = threading.Lock()
+        self._live_states = {}
+        self._state_bases = {}
         return self
 
     def fork(
@@ -235,6 +300,88 @@ class HHAgent:
         # this grows without bound as a chain deepens. See TODO.md.
         return [message for node in self.lineage() for message in node.messages]
 
+    def state_tools(self) -> list[str]:
+        """Names of the tools this chain has committed state deltas for."""
+        names: list[str] = []
+        for node in self.lineage():
+            for name in node.state_deltas:
+                if name not in names:
+                    names.append(name)
+        return names
+
+    def merged_state(self, tool: str) -> dict[str, Any]:
+        """A tool's state as of this block.
+
+        The values are the stored deltas' own objects, so treat the result as
+        read-only; `tool_state()` returns a copy a tool may edit in place.
+        """
+        state: dict[str, Any] = {}
+        for node in self.lineage():
+            delta = node.state_deltas.get(tool)
+            if delta is None:
+                continue
+            state.update(delta.changed)
+            for key in delta.removed:
+                state.pop(key, None)
+        return state
+
+    def tool_state(self, tool: str) -> dict[str, Any]:
+        """A deep copy of `merged_state`, safe to hand to a tool to mutate."""
+        return copy.deepcopy(self.merged_state(tool))
+
+    def all_states(self) -> dict[str, dict[str, Any]]:
+        """Every touched tool's state as of this block, for reporting."""
+        return {name: self.merged_state(name) for name in self.state_tools()}
+
+    def _live_state(self, tool: str) -> dict[str, Any]:
+        """One tool's mutable state, loaded once per turn and kept live.
+
+        The baseline is kept next to it so the turn's diff is measured against
+        the state as it stood when the turn began, not against the last call.
+        """
+        if tool not in self._live_states:
+            self._state_bases[tool] = self.merged_state(tool)
+            self._live_states[tool] = copy.deepcopy(self._state_bases[tool])
+        return self._live_states[tool]
+
+    def _release_states(self, hook: EventHook | None, outcome: str) -> None:
+        """Commit this turn's tool state if it succeeded, drop it otherwise.
+
+        Called once, from the turn's `finally`, which is what makes a block's
+        state atomic: a turn lands whole or not at all.
+        """
+        for tool, live in self._live_states.items():
+            before = self._state_bases.get(tool, {})
+            changed = {
+                key: value
+                for key, value in live.items()
+                if key not in before or not _same_value(before[key], value)
+            }
+            removed = tuple(key for key in before if key not in live)
+            if not changed and not removed:
+                continue
+            if outcome != "commit":
+                self._emit(
+                    hook,
+                    "state_discarded",
+                    tool=tool,
+                    changed=sorted(changed),
+                    removed=list(removed),
+                    reason=outcome,
+                )
+                continue
+            self.state_deltas[tool] = StateDelta(changed=changed, removed=removed)
+            self._emit(
+                hook,
+                "state_delta",
+                tool=tool,
+                changed=sorted(changed),
+                removed=list(removed),
+                keys=sorted(self.merged_state(tool)),
+            )
+        self._live_states.clear()
+        self._state_bases.clear()
+
     def cancel(self) -> bool:
         """Ask the running turn to stop, returning whether one was running.
 
@@ -268,6 +415,7 @@ class HHAgent:
         started = time.monotonic()
         parts: list[str] = []
         tool_calls = 0
+        outcome = "abandoned"
         # cleared here, on the turn thread, so an idle cancel cannot leak in
         self._cancel.clear()
         try:
@@ -313,6 +461,7 @@ class HHAgent:
                     ],
                 )
                 if not calls:
+                    outcome = "commit"
                     self._finish(hook, started, parts, round_no, tool_calls)
                     return
                 tool_calls += len(calls)
@@ -323,6 +472,7 @@ class HHAgent:
             )
         except HHAgentCancelled as exc:
             self.error = str(exc)
+            outcome = "cancelled"
             self._emit(
                 hook,
                 "turn_cancelled",
@@ -335,6 +485,7 @@ class HHAgent:
             raise
         except Exception as exc:
             self.error = str(exc)
+            outcome = "failed"
             self._emit(
                 hook,
                 "turn_failed",
@@ -347,6 +498,7 @@ class HHAgent:
             )
             raise
         finally:
+            self._release_states(hook, outcome)
             self.dirty = False
             self._run_lock.release()
 
@@ -614,7 +766,37 @@ class HHAgent:
                 name=name,
             )
             started = time.monotonic()
-            text, error = self._invoke_tool(name, raw)
+            tool = self.tools.get(name)
+            if tool is None:
+                text, error = f"Error: unknown tool '{name}'", "unknown_tool"
+            else:
+                arguments, parse_error = _parse_arguments(name, raw)
+                if parse_error is not None:
+                    text, error = parse_error, "bad_arguments"
+                elif not isinstance(arguments, dict):
+                    text, error = (
+                        f"Error: arguments for '{name}' must be a JSON object",
+                        "bad_arguments",
+                    )
+                else:
+                    context = ToolContext(
+                        tool=tool,
+                        agent=self,
+                        call_id=call_id,
+                        arguments=arguments,
+                        raw_arguments=raw,
+                        state=self._live_state(name),
+                    )
+                    self._emit(
+                        hook,
+                        "state_loaded",
+                        round=round_no,
+                        call_id=call_id,
+                        tool=name,
+                        keys=sorted(context.state),
+                        inherited=len(self._state_bases.get(name) or {}),
+                    )
+                    text, error = _run_hook(tool, context)
             self._emit(
                 hook,
                 "tool_call_finished",
@@ -629,38 +811,6 @@ class HHAgent:
             )
             results.append({"role": "tool", "tool_call_id": call_id, "content": text})
         return results
-
-    def _invoke_tool(self, name: str, raw_arguments: Any) -> tuple[str, str | None]:
-        """Run a single tool: returns the text for the model and why it failed."""
-        tool = self.tools.get(name)
-        if tool is None:
-            return f"Error: unknown tool '{name}'", "unknown_tool"
-        if isinstance(raw_arguments, str):
-            try:
-                arguments = json.loads(raw_arguments) if raw_arguments.strip() else {}
-            except json.JSONDecodeError as exc:
-                return (
-                    f"Error: arguments for '{name}' are not valid JSON: {exc}",
-                    "bad_arguments",
-                )
-        elif isinstance(raw_arguments, dict):
-            arguments = raw_arguments
-        else:
-            arguments = {}
-        if not isinstance(arguments, dict):
-            return (
-                f"Error: arguments for '{name}' must be a JSON object",
-                "bad_arguments",
-            )
-        try:
-            return tool.hook(**arguments), None
-        except TypeError as exc:
-            return f"Error: bad arguments for '{name}': {exc}", "bad_arguments"
-        except Exception as exc:  # a failing tool must not abort the conversation
-            return (
-                f"Error: tool '{name}' raised {type(exc).__name__}: {exc}",
-                "tool_raised",
-            )
 
     def _remember(
         self, hook: EventHook | None, message: dict[str, Any], source: str

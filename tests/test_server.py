@@ -140,6 +140,7 @@ class SessionTests(ServerTestCase):
                 "set_magic_number",
                 "get_magic_number",
                 "web_fetch",
+                "web_search",
             ],
         )
         setter = hello["tools"][2]
@@ -361,9 +362,10 @@ class CreateAgentTests(ServerTestCase):
                 "get_system_info",
                 "set_magic_number",
                 "web_fetch",
+                "web_search",
             ],
         )
-        self.assertEqual(len(created["tool_schemas"]), 5)
+        self.assertEqual(len(created["tool_schemas"]), 6)
 
     def test_an_id_is_generated_when_omitted(self):
         fixture = self.start_server()
@@ -564,6 +566,7 @@ class ForkTests(ServerTestCase):
                 "get_system_info",
                 "set_magic_number",
                 "web_fetch",
+                "web_search",
             ],
         )
         self.assertEqual(forked["local_tools"], [])

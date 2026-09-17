@@ -281,6 +281,7 @@ class RootAndForkTests(HHTestCase):
                 "get_system_info",
                 "set_magic_number",
                 "web_fetch",
+                "web_search",
             ],
         )
 

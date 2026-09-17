@@ -264,6 +264,7 @@ lucky.
 | `set_magic_number` | `magic` | stores a number in the shared `magic` namespace |
 | `get_magic_number` | `magic` | reads it back |
 | `web_fetch` | `web_fetch` | reads a URL through Jina's reader and returns Jina's Markdown of the page |
+| `web_search` | `web_search` | searches through Exa and returns short excerpts (title, URL, highlights) of the top results |
 
 The `magic` pair is the worked example of a shared namespace, and the pair used to
 test that forking rewinds state. Before they declared `state_namespace="magic"`
@@ -278,6 +279,11 @@ external effects and a failed turn says nothing about it. Set `JINA_API_KEY` in 
 server's environment to authenticate the call; without it Jina rate-limits the
 caller by IP. A page longer than `WEB_FETCH_MAX_CHARS` (20 000 characters) comes
 back truncated with a note saying how much was cut.
+
+`web_search` is its other half: it asks Exa for the best pages matching a query and
+returns their titles, URLs and excerpts, which is what you want before you have a
+URL at all. It needs no key either, Exa rate-limits the free endpoint by IP, and —
+like `web_fetch` — it only reads, so it declares no external effects.
 
 ## Checklist
 

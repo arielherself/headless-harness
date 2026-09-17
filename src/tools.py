@@ -1,3 +1,4 @@
+import json
 import os
 import platform
 from collections.abc import Callable
@@ -177,6 +178,29 @@ get_magic_number_tool = ToolEntry(
     state_namespace="magic",
 )
 
+def _jsonrpc_replies(text: str) -> list[dict[str, Any]]:
+    """The JSON-RPC payloads in an MCP answer: SSE frames or one JSON body."""
+    try:
+        return [json.loads(text)]
+    except json.JSONDecodeError:
+        replies = []
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            try:
+                replies.append(json.loads(line[5:].strip()))
+            except json.JSONDecodeError:
+                continue
+        return replies
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cut a tool result to `limit` characters, saying how much was dropped."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n\n[truncated: showing the first {limit} of {len(text)} characters]"
+
+
 # Jina's reader renders a URL as Markdown for a model to read. An API key is
 # optional — it lifts the anonymous rate limit — so it is read from the
 # environment when the operator has one.
@@ -207,12 +231,7 @@ def web_fetch_executor(context: ToolContext, url: str) -> str:
         return f"Error: Jina Reader answered HTTP {response.status_code}: {detail}"
     if not text:
         return "Error: Jina Reader returned an empty document."
-    if len(text) > WEB_FETCH_MAX_CHARS:
-        return (
-            f"{text[:WEB_FETCH_MAX_CHARS]}\n\n"
-            f"[truncated: showing the first {WEB_FETCH_MAX_CHARS} of {len(text)} characters]"
-        )
-    return text
+    return _truncate(text, WEB_FETCH_MAX_CHARS)
 
 
 web_fetch_tool = ToolEntry(
@@ -239,10 +258,101 @@ web_fetch_tool = ToolEntry(
 )
 
 
+# Exa's search is an MCP endpoint that answers a JSON-RPC `tools/call` over plain
+# HTTP — no key, no session — so one POST is the whole conversation. Their free
+# tier rate-limits by IP.
+EXA_MCP = "https://mcp.exa.ai/mcp"
+WEB_SEARCH_TIMEOUT = 60.0
+# a handful of results is what a model can act on, and a second, sharper query
+# beats a longer list
+WEB_SEARCH_RESULTS = 5
+WEB_SEARCH_MAX_CHARS = 20_000
+
+
+def web_search_executor(context: ToolContext, query: str, objective: str) -> str:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "web_search_exa",
+            "arguments": {
+                "query": query,
+                "objective": objective,
+                "numResults": WEB_SEARCH_RESULTS,
+            },
+        },
+    }
+    try:
+        response = requests.post(
+            EXA_MCP,
+            json=payload,
+            headers={"Accept": "application/json, text/event-stream"},
+            timeout=WEB_SEARCH_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return f"Error: could not reach Exa: {exc}"
+    replies = [reply for reply in _jsonrpc_replies(response.text) if isinstance(reply, dict)]
+    failure = next((reply["error"] for reply in replies if "error" in reply), None)
+    if failure is not None:
+        message = failure.get("message") if isinstance(failure, dict) else failure
+        return f"Error: Exa refused the search: {message}"
+    if not response.ok:
+        detail = " ".join(response.text.split())[:200]
+        return f"Error: Exa answered HTTP {response.status_code}: {detail}"
+    result = next((reply["result"] for reply in replies if "result" in reply), None)
+    if not isinstance(result, dict):
+        return "Error: Exa's answer held no result."
+    text = "\n".join(
+        block.get("text", "")
+        for block in result.get("content") or []
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
+    if result.get("isError"):
+        return f"Error: Exa could not run the search: {text or 'no detail'}"
+    if not text:
+        return "Error: Exa returned no results."
+    return _truncate(text, WEB_SEARCH_MAX_CHARS)
+
+
+web_search_tool = ToolEntry(
+    name="web_search",
+    description=(
+        "Search the web through Exa and get back short, read-ready excerpts of "
+        "the top results — title, URL and highlights, not whole pages. Use it when "
+        "you need current information or a good page to read but have no URL yet, "
+        "then follow up with web_fetch to read a result in full. It cannot search "
+        "inside private or login-gated sources."
+    ),
+    params=[
+        ToolParam(
+            name="query",
+            type="string",
+            description=(
+                "a description of the page you want, not keywords — e.g. 'blog "
+                "post comparing React and Vue performance'"
+            ),
+        ),
+        ToolParam(
+            name="objective",
+            type="string",
+            description=(
+                "what this search is for: which documents should rank first and "
+                "which facts to pull out of them"
+            ),
+        ),
+    ],
+    hook=web_search_executor,
+    # a read as well: nothing it does leaves a later turn anything to trip over
+    external_effects=False,
+)
+
+
 builtin_tools = [
     get_system_info_tool,
     get_current_time_tool,
     set_magic_number_tool,
     get_magic_number_tool,
     web_fetch_tool,
+    web_search_tool,
 ]

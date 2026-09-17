@@ -1,5 +1,6 @@
 """Tests for `src/tools.py`: the tool schema, its state rules and the builtins."""
 
+import json
 import os
 import re
 import unittest
@@ -63,7 +64,7 @@ class ToolContextTests(unittest.TestCase):
 
 
 class BuiltinToolTests(unittest.TestCase):
-    def test_the_catalogue_is_the_five_builtins(self):
+    def test_the_catalogue_is_the_six_builtins(self):
         self.assertEqual(
             [tool.name for tool in tools.builtin_tools],
             [
@@ -72,6 +73,7 @@ class BuiltinToolTests(unittest.TestCase):
                 "set_magic_number",
                 "get_magic_number",
                 "web_fetch",
+                "web_search",
             ],
         )
 
@@ -271,6 +273,101 @@ class WebFetchToolTests(unittest.TestCase):
             text = self.call(url="https://example.com")
         self.assertIn("truncated", text)
         self.assertLess(len(text), tools.WEB_FETCH_MAX_CHARS + 200)
+
+
+def exa_answer(text):
+    """An SSE answer shaped like the one Exa's MCP endpoint sends back."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"content": [{"type": "text", "text": text}]},
+    }
+    return f"event: message\ndata: {json.dumps(payload)}\n\n"
+
+
+class WebSearchToolTests(unittest.TestCase):
+    """`web_search` speaks JSON-RPC to Exa, so the HTTP call is stubbed here."""
+
+    def call(self, **arguments):
+        """Call the hook the way the harness does: `hook(context, **arguments)`."""
+        context = tools.ToolContext(
+            tool=tools.web_search_tool,
+            agent=None,
+            call_id="c",
+            arguments=arguments,
+            raw_arguments="{}",
+            state={},
+        )
+        return tools.web_search_executor(context, **context.arguments)
+
+    def test_it_points_at_web_fetch_for_the_full_page(self):
+        description = tools.web_search_tool.description
+        self.assertIn("excerpts", description)
+        self.assertIn("web_fetch", description)
+
+    def test_it_calls_the_exa_search_tool(self):
+        response = mock.Mock(ok=True, status_code=200, text=exa_answer("Title: A\nURL: https://a.test"))
+        with mock.patch("requests.post", return_value=response) as post:
+            text = self.call(query="a page about A", objective="rank A first")
+        self.assertEqual(text, "Title: A\nURL: https://a.test")
+        self.assertEqual(post.call_args.args[0], tools.EXA_MCP)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["method"], "tools/call")
+        self.assertEqual(payload["params"]["name"], "web_search_exa")
+        self.assertEqual(
+            payload["params"]["arguments"],
+            {
+                "query": "a page about A",
+                "objective": "rank A first",
+                "numResults": tools.WEB_SEARCH_RESULTS,
+            },
+        )
+        self.assertEqual(post.call_args.kwargs["timeout"], tools.WEB_SEARCH_TIMEOUT)
+        self.assertIn("text/event-stream", post.call_args.kwargs["headers"]["Accept"])
+
+    def test_a_plain_json_answer_is_read_too(self):
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "one hit"}]}}
+        )
+        response = mock.Mock(ok=True, status_code=200, text=body)
+        with mock.patch("requests.post", return_value=response):
+            self.assertEqual(self.call(query="q", objective="o"), "one hit")
+
+    def test_a_json_rpc_error_is_reported_to_the_model(self):
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "rate limited"}}
+        )
+        response = mock.Mock(ok=True, status_code=200, text=body)
+        with mock.patch("requests.post", return_value=response):
+            text = self.call(query="q", objective="o")
+        self.assertIn("rate limited", text)
+
+    def test_an_http_error_is_reported_to_the_model(self):
+        response = mock.Mock(ok=False, status_code=503, text="upstream unavailable")
+        with mock.patch("requests.post", return_value=response):
+            text = self.call(query="q", objective="o")
+        self.assertIn("503", text)
+        self.assertIn("upstream unavailable", text)
+
+    def test_a_dead_network_is_reported_to_the_model(self):
+        with mock.patch("requests.post", side_effect=requests.ConnectionError("no route")):
+            text = self.call(query="q", objective="o")
+        self.assertTrue(text.startswith("Error"))
+        self.assertIn("no route", text)
+
+    def test_an_answer_without_results_is_reported_to_the_model(self):
+        response = mock.Mock(ok=True, status_code=200, text=exa_answer(""))
+        with mock.patch("requests.post", return_value=response):
+            text = self.call(query="q", objective="o")
+        self.assertIn("no results", text)
+
+    def test_a_long_answer_is_truncated(self):
+        body = exa_answer("x" * (tools.WEB_SEARCH_MAX_CHARS + 500))
+        response = mock.Mock(ok=True, status_code=200, text=body)
+        with mock.patch("requests.post", return_value=response):
+            text = self.call(query="q", objective="o")
+        self.assertIn("truncated", text)
+        self.assertLess(len(text), tools.WEB_SEARCH_MAX_CHARS + 200)
 
 
 if __name__ == "__main__":

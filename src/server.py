@@ -14,7 +14,7 @@ earlier block again; the blocks beyond it stay untouched.
 Commands
     create_agent   {id?, endpoint?, key?, model?, tools?, timeout?,
                     include_usage?, verbose?}          makes a root block
-    fork           {id, prompt, new_id?, model?, tools?, timeout?,
+    fork           {id, prompt, images?, new_id?, model?, tools?, timeout?,
                     include_usage?, verbose?}          appends a block
     run            {id}                                executes a block's turn
     cancel         {id}                                stop a running turn
@@ -93,6 +93,7 @@ from agent import (
     HHAgentCancelled,
     HHAgentError,
     StateDelta,
+    image_content_parts,
 )
 from protocol import PROTOCOL_VERSION
 from store import HHStore, HHStoreError
@@ -130,6 +131,10 @@ COMMANDS: list[dict[str, Any]] = [
         "fields": {
             "id": "required, the block to fork from",
             "prompt": "required, non-empty string",
+            "images": (
+                "optional list of image URLs or data: URIs; each a string "
+                "or {url, detail}"
+            ),
             "new_id": "optional id for the new block",
             "model": "optional override inherited from the parent",
             "tools": "optional override inherited from the parent",
@@ -510,8 +515,9 @@ class HHServer(socketserver.ThreadingTCPServer):
         new_id = command.get("new_id")
         if new_id is not None and (not isinstance(new_id, str) or not new_id):
             raise HHTcpError("bad_id", "'new_id' must be a non-empty string")
+        images = parse_images(command.get("images"))
         try:
-            child = parent.fork(prompt, id=new_id)
+            child = parent.fork(prompt, id=new_id, images=images)
         except HHAgentError as exc:
             raise HHTcpError(
                 "parent_dirty",
@@ -536,6 +542,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             dirty=child.dirty,
             prompt=child.prompt,
             prompt_chars=len(child.prompt),
+            image_count=child.image_count,
             path=child.path(),
             context_len=len(child.context()),
             model=child.model,
@@ -923,6 +930,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             "error": block.error,
             "prompt_chars": len(block.prompt),
             "prompt_preview": block.prompt[:200],
+            "image_count": block.image_count,
             "text_chars": len(block.text),
             "local_len": len(block.messages),
             "context_len": len(block.context()),
@@ -949,6 +957,14 @@ def require_id(command: dict[str, Any]) -> str:
     if not isinstance(agent_id, str) or not agent_id:
         raise HHTcpError("bad_id", "'id' must be a non-empty string")
     return agent_id
+
+
+def parse_images(value: Any) -> list[dict[str, Any]]:
+    """Check the wire `images` field and render it as content parts."""
+    try:
+        return image_content_parts(value)
+    except HHAgentError as exc:
+        raise HHTcpError("bad_image", str(exc)) from exc
 
 
 def apply_overrides(block: HHAgent, command: dict[str, Any]) -> None:

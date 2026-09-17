@@ -243,7 +243,7 @@ and the settings that shape a turn.
   refuses to pickle costs only that tool's state, and `persist_warning` says so.
 
 **Write points.** A block is written twice: once at `fork` (holding just the
-prompt) and once when its turn ends. Nothing is written during a turn, so a
+prompt and any images) and once when its turn ends. Nothing is written during a turn, so a
 process that dies mid-turn leaves the block looking forked-but-never-run and the
 whole turn is retried from scratch.
 

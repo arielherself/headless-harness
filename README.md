@@ -114,6 +114,12 @@ turn exactly once: it is `dirty` from `fork` until the turn ends, and forking
 from a dirty block is refused because its context is still growing. Rewinding is
 just forking from an earlier block again — the blocks beyond it stay untouched.
 
+**Images can ride along.** A fork may pass `images` — URLs or `data:` URIs —
+next to its prompt. Only then does the user message become a content-part list
+(text first, then one `image_url` part each); `prompt` stays the text either
+way, so nothing that reads a block's prompt has to change. See
+[`docs/protocol.md`](docs/protocol.md#images).
+
 **Tool state is incremental too.** A tool is handed a mutable `dict` already
 overlaid with its ancestors' deltas; whatever it changed when a *successful* turn
 ends is frozen into that block. Forking therefore rewinds tool memory as well. A

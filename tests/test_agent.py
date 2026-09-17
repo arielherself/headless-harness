@@ -317,6 +317,69 @@ class RootAndForkTests(HHTestCase):
         self.assertEqual(child.state_deltas, {})
         self.assertFalse(root.dirty)
 
+    def test_fork_carries_images_as_content_parts(self):
+        data_uri = "data:image/png;base64,AAAA"
+        root = self.root()
+        child = root.fork(
+            "look",
+            images=[
+                data_uri,
+                {"url": "https://example.test/cat.webp", "detail": "high"},
+            ],
+        )
+        self.assertEqual(child.prompt, "look")
+        self.assertEqual(
+            child.messages,
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.test/cat.webp",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(child.image_count, 2)
+        self.assertEqual(child.context(), child.messages)
+
+    def test_one_image_may_be_given_alone_and_detail_is_optional(self):
+        data_uri = "data:image/png;base64,AAAA"
+        root = self.root()
+        self.assertEqual(root.fork("a", images=data_uri).image_count, 1)
+        child = root.fork("b", images=[{"url": "https://x.test/i.png"}])
+        self.assertEqual(
+            child.messages[0]["content"][1],
+            {"type": "image_url", "image_url": {"url": "https://x.test/i.png"}},
+        )
+        self.assertEqual(root.fork("c").image_count, 0)
+
+    def test_a_bad_image_fails_the_fork_and_leaves_no_block(self):
+        root = self.root()
+        for bad in (
+            5,
+            {"no": "url"},
+            [""],
+            [{"url": 5}],
+            [{"url": "x", "detail": 5}],
+            [["nested"]],
+        ):
+            with self.assertRaises(agent.HHAgentError):
+                root.fork("look", images=bad)
+        self.assertFalse(root.dirty)
+
+    def test_fork_images_may_be_already_normalized_parts(self):
+        part = {"type": "image_url", "image_url": {"url": "https://x.test/i.png"}}
+        child = self.root().fork("look", images=[part])
+        self.assertEqual(child.messages[0]["content"][1], part)
+
     def test_fork_inherits_settings_and_can_override_them(self):
         def hook(event):
             pass
@@ -527,6 +590,36 @@ class TurnLifecycleTests(HHTestCase):
                 }
             ],
         )
+
+    def test_images_go_out_as_content_parts_and_are_summarised_by_count(self):
+        data_uri = "data:image/png;base64,SUPERSECRETBYTES"
+        self.provider.text("seen")
+        block = self.root(tools=[]).fork("what is this?", images=[data_uri])
+        events = []
+        reply = self.run_turn(block, on_event=events.append)
+        self.assertEqual(reply, "seen")
+        self.assertEqual(
+            self.provider.last_payload()["messages"],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                    ],
+                }
+            ],
+        )
+        # the outgoing-context summary counts the image instead of quoting it
+        self.assertEqual(
+            pick(events, "request_payload")[0]["messages"],
+            [{"role": "user", "chars": 13, "image_count": 1}],
+        )
+        self.assertEqual(pick(events, "turn_started")[0]["image_count"], 1)
+        appended = pick(events, "history_appended")[0]
+        self.assertEqual(appended["preview"], "what is this?")
+        self.assertEqual(appended["chars"], 13)
+        self.assertEqual(appended["image_count"], 1)
 
     def test_include_usage_false_drops_stream_options(self):
         self.provider.text("ok")
@@ -1917,6 +2010,20 @@ class FailureNoteTests(HHTestCase):
         self.assertIn("The turn that failed, as it was recorded:", prompt)
         self.assertIn("get_current_time", prompt)
         self.assertIn("The reported error: 503", prompt)
+
+    def test_the_summary_prompt_never_carries_image_bytes(self):
+        data_uri = "data:image/png;base64,SUPERSECRETBYTES"
+        self.provider.script(
+            Response.tool_call("get_current_time", {}, "c1"),
+            Response.error(503),
+            Response.text("it was checking the clock"),
+        )
+        block = self.root().fork("what time is it?", images=[data_uri])
+        thread = self.turn(block)
+        thread.join()
+        transcript = self.provider.last_payload()["messages"][1]["content"]
+        self.assertIn("what time is it?", transcript)
+        self.assertNotIn("SUPERSECRETBYTES", transcript)
 
     def test_the_summary_model_can_differ(self):
         self.provider.script(

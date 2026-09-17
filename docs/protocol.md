@@ -1,7 +1,7 @@
 # Protocol
 
 The server speaks **newline-delimited JSON over TCP**: one JSON object per line,
-in both directions, UTF-8. Default `127.0.0.1:8765`, protocol version `2`.
+in both directions, UTF-8. Default `127.0.0.1:8765`, protocol version `3`.
 
 A line longer than 8 MiB is rejected with `command_too_large` and the connection
 closes. The server binds to loopback by default and has no authentication — it is
@@ -98,6 +98,7 @@ endpoint, key, model, tools and options, and **starts dirty**.
 |---|---|
 | `id` | **required** — the parent to fork from |
 | `prompt` | **required** — non-empty string |
+| `images` | optional — images sent with the prompt (see [Images](#images)) |
 | `new_id` | optional id for the new block; supply it to avoid waiting for the reply |
 | `model` `tools` `local_tools` `timeout` `local_timeout` `summary_model` `include_usage` `verbose` | optional overrides for the child only |
 
@@ -106,14 +107,45 @@ and carries the other half over, so a fork can add a local tool without losing
 the inherited builtins.
 
 → `agent_forked` (`agent_id`, `parent`, `depth`, `dirty`, `prompt`,
-`prompt_chars`, `path` (ids root → child), `context_len`, `model`, `timeout`,
-`include_usage`, `verbose`, `tools`, `local_tools`, `state_namespaces`).
+`prompt_chars`, `image_count`, `path` (ids root → child), `context_len`, `model`,
+`timeout`, `include_usage`, `verbose`, `tools`, `local_tools`,
+`state_namespaces`).
 
-Errors: `bad_id`, `bad_prompt`, `unknown_agent`, `parent_dirty`,
+Errors: `bad_id`, `bad_prompt`, `bad_image`, `unknown_agent`, `parent_dirty`,
 `duplicate_agent`, `unknown_tool`, `bad_field`.
 
 Because the child's id is yours to choose, `fork` and `run` can be pipelined on
 two consecutive lines without waiting for `agent_forked`.
+
+#### Images
+
+`fork` may carry images alongside the prompt. `images` is a list whose entries
+are either a string — an `https:` URL or a `data:` URI — or an object with a
+`url` and an optional `detail` (`auto`, `low` or `high`):
+
+```jsonc
+{"command":"fork","rid":"3","id":"root","new_id":"a1","prompt":"what is this?",
+ "images":["data:image/png;base64,iVBOR…",
+           {"url":"https://example.test/cat.webp","detail":"low"}]}
+```
+
+The block's user message then becomes an OpenAI-style content-part list: a
+`text` part first, then one `image_url` part per image. Without `images` the
+message stays the plain string it has always been, and `prompt` is the text in
+both cases:
+
+```jsonc
+{"role":"user","content":[{"type":"text","text":"what is this?"},
+                          {"type":"image_url","image_url":{"url":"data:…"}}]}
+```
+
+Images ride in the same single JSON line as everything else, so a `data:` URI
+counts against the 8 MiB limit (base64 adds about a third). `prompt` stays
+required and non-empty: images ride along with text, they do not replace it.
+`image_count` reports how many parts a block holds without echoing the bytes.
+This arrived in protocol `3`: a `2` server does not know the field and would
+ignore it, so check `session_hello.protocol` before sending images to an
+unknown server.
 
 ### `run`
 
@@ -191,8 +223,8 @@ No fields. → `agents_listed` (`count`, `roots`, `dirty` — ids currently dirt
 
 Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `outcome`
 (`ok` / `failed` / `cancelled` / `abandoned`, null before the turn has run),
-`error`, `prompt_chars`, `prompt_preview`, `text_chars`, `local_len`,
-`context_len`, `model`, `summary_model`, `tools`, `local_tools`,
+`error`, `prompt_chars`, `prompt_preview`, `image_count`, `text_chars`,
+`local_len`, `context_len`, `model`, `summary_model`, `tools`, `local_tools`,
 `state_namespaces`, `waiting_on` (local calls this block is parked on),
 `include_usage`, `verbose`, `created_at`, `age_ms`.
 
@@ -273,7 +305,7 @@ unreadable row).
 
 | Event | Fields |
 |---|---|
-| `turn_started` | `prompt`, `prompt_chars`, `depth`, `path`, `model`, `tools`, `context_len`, `include_usage`, `verbose` |
+| `turn_started` | `prompt`, `prompt_chars`, `image_count`, `depth`, `path`, `model`, `tools`, `context_len`, `include_usage`, `verbose` |
 | `turn_finished` | `text`, `text_chars`, `rounds`, `tool_calls`, `elapsed_ms`, `messages`, `context_len`, `dirty: false` |
 | `turn_failed` | `error`, `error_type`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
 | `turn_cancelled` | `error`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
@@ -286,7 +318,7 @@ requests tools is followed by another round until the model answers with text.
 | Event | Fields |
 |---|---|
 | `request_started` | `round`, `url`, `model`, `timeout`, `request_bytes`, `messages`, `tools`, `depth`, `include_usage` |
-| `request_payload` | `round`, `messages` — a per-message summary: `role`, `chars`, and `tool_call_id` / `tool_calls` when present |
+| `request_payload` | `round`, `messages` — a per-message summary: `role`, `chars`, `image_count` when the message has images, and `tool_call_id` / `tool_calls` when present |
 | `response_received` | `round`, `status`, `reason`, `content_type`, `elapsed_ms` |
 | `request_finished` | `round`, `status`, `chunks`, `payload_chars`, `finish_reason`, `first_chunk_ms`, `elapsed_ms`, `cancelled` |
 | `request_failed` | `round`, `error`, `error_type`, `elapsed_ms` (plus `chunks` when it failed mid-stream) |
@@ -301,7 +333,7 @@ requests tools is followed by another round until the model answers with text.
 | `reasoning_delta` | `round`, `text`, `chars` — the model's reasoning, kept out of the reply |
 | `usage` | `round`, `usage` — the provider's token accounting, when it sends any |
 | `assistant_message` | `round`, `content`, `content_chars`, `tool_calls` (`call_id`, `name`, `arguments`) — the round's message, assembled |
-| `history_appended` | `source` (`fork` / `assistant` / `tool`), `role`, `chars`, `preview` (first 200), `tool_call_id`, `tool_calls`, `messages`, `context_len` |
+| `history_appended` | `source` (`fork` / `assistant` / `tool`), `role`, `chars`, `preview` (first 200), `image_count`, `tool_call_id`, `tool_calls`, `messages`, `context_len` |
 
 ### Tool
 
@@ -487,6 +519,7 @@ client-run in its definition — or the note will quietly leave them out.
 | `unknown_command` | no such command; the reply lists the valid ones |
 | `bad_id` | `id` / `new_id` missing or not a non-empty string |
 | `bad_prompt` | `prompt` missing or empty |
+| `bad_image` | `images` was malformed: not a list, an entry without a non-empty `url`, or a non-string `detail` |
 | `bad_field` | a field had the wrong type or value |
 | `bad_tools` | `tools` / `local_tools` was malformed, or a name is declared twice |
 | `unknown_tool` | a name is not in the catalogue |

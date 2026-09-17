@@ -552,6 +552,7 @@ class ForkTests(ServerTestCase):
         self.assertTrue(forked["dirty"])
         self.assertEqual(forked["prompt"], "hello")
         self.assertEqual(forked["prompt_chars"], 5)
+        self.assertEqual(forked["image_count"], 0)
         self.assertEqual(forked["path"], ["root", "a1"])
         self.assertEqual(forked["context_len"], 1)
         self.assertEqual(forked["model"], TEST_MODEL)
@@ -571,6 +572,71 @@ class ForkTests(ServerTestCase):
         )
         self.assertEqual(forked["local_tools"], [])
         self.assertEqual(forked["state_namespaces"], [])
+
+    def test_fork_carries_images_over_the_wire(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        self.create(client, "root")
+        data_uri = "data:image/png;base64,AAAA"
+        mark = client.mark()
+        client.command(
+            "fork",
+            id="root",
+            prompt="what is this?",
+            new_id="a1",
+            images=[
+                data_uri,
+                {"url": "https://example.test/cat.webp", "detail": "low"},
+            ],
+        )
+        forked = client.wait_event("agent_forked", since=mark)
+        self.assertEqual(forked["prompt"], "what is this?")
+        self.assertEqual(forked["prompt_chars"], 13)
+        self.assertEqual(forked["image_count"], 2)
+
+        client.command("get_context", id="a1")
+        context = client.wait_event("context")
+        self.assertEqual(
+            context["messages"],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.test/cat.webp",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        client.command("list_agents")
+        listed = client.wait_event("agents_listed")
+        entry = [a for a in listed["agents"] if a["agent_id"] == "a1"][0]
+        self.assertEqual(entry["image_count"], 2)
+
+    def test_bad_images_are_refused_and_leave_no_block(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        self.create(client, "root")
+        cases = [
+            5,
+            "",
+            [{"url": 5}],
+            [{"url": "x", "detail": 5}],
+            [["nested"]],
+        ]
+        for index, bad in enumerate(cases):
+            rid = f"r{index}"
+            client.send("fork", rid=rid, id="root", prompt="hi", images=bad)
+            client.wait_error(rid, code="bad_image")
+        client.command("list_agents")
+        self.assertEqual(client.wait_event("agents_listed")["count"], 1)
 
     def test_long_prompts_are_reported_in_full_but_previewed_short(self):
         fixture = self.start_server()
@@ -1611,6 +1677,31 @@ class PersistenceTests(ServerTestCase):
             ["and again", "second answer"],
         )
 
+    def test_an_image_message_survives_a_restart(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        self.create(client, "root")
+        data_uri = "data:image/png;base64,AAAA"
+        self.fork(client, "root", "look", new_id="a1", images=[data_uri])
+        self.stop_server(fixture)
+
+        second = self.start_server()
+        client = second.client()
+        client.wait_event("session_hello")
+        client.command("get_context", id="a1")
+        context = client.wait_event("context")
+        self.assertEqual(
+            context["context"][0]["content"],
+            [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        )
+        client.command("list_agents")
+        listed = client.wait_event("agents_listed")
+        entry = [a for a in listed["agents"] if a["agent_id"] == "a1"][0]
+        self.assertEqual(entry["image_count"], 1)
+
     def test_a_restart_keeps_local_tool_definitions(self):
         fixture = self.start_server()
         client = fixture.client()
@@ -2120,7 +2211,7 @@ class MainTests(unittest.TestCase):
         )
         self.assertIn("listening on 127.0.0.1:0", text)
         self.assertIn("model default a-model", text)
-        self.assertIn("protocol 2", text)
+        self.assertIn(f"protocol {server.PROTOCOL_VERSION}", text)
         self.assertIn("credentials: flags", text)
         self.assertIn("store: /tmp/x.db (123 bytes, limit 2048)", text)
         self.assertIn("shutting down", text)

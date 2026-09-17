@@ -3,7 +3,7 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Self
 
@@ -50,6 +50,81 @@ class HHAgentCancelled(HHAgentError):
 def new_id() -> str:
     """A short, collision-resistant block id."""
     return f"agent-{uuid.uuid4().hex[:12]}"
+
+
+def image_content_parts(images: Any) -> list[dict[str, Any]]:
+    """Normalize images into the content parts the provider expects.
+
+    Each image is a URL or `data:` URI string, or a mapping with a non-empty
+    `url` and an optional `detail` (`auto`, `low` or `high`, passed through).
+    `None`, an empty sequence and a single entry are all accepted, as is an
+    already-normalized `image_url` part. Anything else raises `HHAgentError`,
+    so a bad image fails the fork rather than reaching the provider.
+    """
+    if images is None:
+        return []
+    if isinstance(images, (str, Mapping)):
+        images = [images]
+    if not isinstance(images, (list, tuple)):
+        raise HHAgentError(
+            "images must be a list of URL strings or {url, detail} objects"
+        )
+    parts: list[dict[str, Any]] = []
+    for index, image in enumerate(images):
+        where = f"image {index + 1}"
+        if isinstance(image, Mapping) and image.get("type") == "image_url":
+            part = dict(image)
+            nested = part.get("image_url")
+            url = nested.get("url") if isinstance(nested, Mapping) else None
+            if not isinstance(url, str) or not url:
+                raise HHAgentError(f"{where} needs a non-empty 'url'")
+            parts.append(part)
+            continue
+        if isinstance(image, str):
+            url, detail = image, None
+        elif isinstance(image, Mapping):
+            url, detail = image.get("url"), image.get("detail")
+        else:
+            raise HHAgentError(
+                f"{where} must be a URL string or a {{url, detail}} object"
+            )
+        if not isinstance(url, str) or not url:
+            raise HHAgentError(f"{where} needs a non-empty 'url'")
+        if detail is not None and not isinstance(detail, str):
+            raise HHAgentError(f"{where} has a non-string 'detail'")
+        rendered: dict[str, Any] = {"type": "image_url", "image_url": {"url": url}}
+        if detail:
+            rendered["image_url"]["detail"] = detail
+        parts.append(rendered)
+    return parts
+
+
+def message_text(content: Any) -> str:
+    """The text of a message's `content`, however it is shaped.
+
+    A message with images holds a list of content parts; anything that reports
+    or summarises a message wants only its text, never a megabyte of base64.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "".join(
+            part.get("text") or ""
+            for part in content
+            if isinstance(part, Mapping) and part.get("type") == "text"
+        )
+    return ""
+
+
+def message_image_count(content: Any) -> int:
+    """How many image parts a message's `content` carries."""
+    if not isinstance(content, (list, tuple)):
+        return 0
+    return sum(
+        1
+        for part in content
+        if isinstance(part, Mapping) and part.get("type") == "image_url"
+    )
 
 
 def _parse_arguments(name: str, raw_arguments: Any) -> tuple[Any, str | None]:
@@ -309,8 +384,16 @@ class HHAgent:
         message: str,
         id: str | None = None,
         on_event: EventHook | None = None,
+        images: Any = None,
     ) -> Self:
         """Start the next block, holding `message` as its user prompt.
+
+        `images`, when given, is a list of image URLs or `data:` URIs — strings,
+        or `{url, detail}` mappings. The child's user message then becomes a
+        content-part list: the text first, then one `image_url` part per image.
+        `prompt` stays the text either way, and without images the message
+        remains the plain string it has always been. Images are validated here,
+        so a bad one fails the fork before a block exists.
 
         The child inherits this block's provider, model, tools and options, and
         starts out `dirty` because its turn has not run yet. Override any of
@@ -322,11 +405,15 @@ class HHAgent:
             )
         if not isinstance(message, str) or not message:
             raise HHAgentError("fork needs a non-empty prompt")
+        parts = image_content_parts(images)
         child = type(self)._blank()
         child.id = id or new_id()
         child.parent = self
         child.prompt = message
-        child.messages = [{"role": "user", "content": message}]
+        content: Any = message
+        if parts:
+            content = [{"type": "text", "text": message}, *parts]
+        child.messages = [{"role": "user", "content": content}]
         child.dirty = True
         child.endpoint = self.endpoint
         child.key = self.key
@@ -349,6 +436,13 @@ class HHAgent:
     def depth(self) -> int:
         """How many blocks precede this one in the chain."""
         return len(self.lineage()) - 1
+
+    @property
+    def image_count(self) -> int:
+        """How many image parts this block's own messages carry."""
+        return sum(
+            message_image_count(message.get("content")) for message in self.messages
+        )
 
     def lineage(self) -> list[Self]:
         """This block and its ancestors, root first."""
@@ -758,7 +852,7 @@ class HHAgent:
         """The transcript of this turn, for the summariser to read."""
         lines = ["The turn that failed, as it was recorded:", ""]
         for message in self.messages:
-            content = (message.get("content") or "")[:4000]
+            content = message_text(message.get("content"))[:4000]
             if message.get("tool_calls"):
                 calls = "; ".join(
                     f"{call['function']['name']}({call['function']['arguments']})"
@@ -971,6 +1065,7 @@ class HHAgent:
                 "turn_started",
                 prompt=self.prompt,
                 prompt_chars=len(self.prompt),
+                image_count=self.image_count,
                 depth=self.depth,
                 path=self.path(),
                 model=self.model,
@@ -1284,10 +1379,14 @@ class HHAgent:
         """Describe the outgoing context without resending every byte."""
         summary = []
         for message in messages:
+            content = message.get("content")
             entry: dict[str, Any] = {
                 "role": message.get("role"),
-                "chars": len(message.get("content") or ""),
+                "chars": len(message_text(content)),
             }
+            images = message_image_count(content)
+            if images:
+                entry["image_count"] = images
             if message.get("tool_call_id"):
                 entry["tool_call_id"] = message["tool_call_id"]
             if message.get("tool_calls"):
@@ -1399,13 +1498,15 @@ class HHAgent:
     ) -> None:
         """Announce a message that this block now holds."""
         content = message.get("content") or ""
+        text = message_text(content)
         self._emit(
             hook,
             "history_appended",
             source=source,
             role=message.get("role"),
-            chars=len(content),
-            preview=content[:200],
+            chars=len(text),
+            preview=text[:200],
+            image_count=message_image_count(content),
             tool_call_id=message.get("tool_call_id"),
             tool_calls=len(message.get("tool_calls") or []),
             messages=len(self.messages),

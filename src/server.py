@@ -94,10 +94,10 @@ from agent import (
     HHAgentError,
     StateDelta,
 )
+from protocol import PROTOCOL_VERSION
 from store import HHStore, HHStoreError
 from tools import ToolEntry, ToolParam, builtin_tools
 
-PROTOCOL_VERSION = 2
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_COMMAND_BYTES = 8 * 1024 * 1024

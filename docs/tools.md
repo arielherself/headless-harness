@@ -259,6 +259,7 @@ lucky.
 
 | Tool | Namespace | What it does |
 |---|---|---|
+| `get_system_info` | `get_system_info` | reports the host: OS, hostname, Python, CPUs, model, protocol version |
 | `get_current_time` | `get_current_time` | reports UTC and local time |
 | `set_magic_number` | `magic` | stores a number in the shared `magic` namespace |
 | `get_magic_number` | `magic` | reads it back |

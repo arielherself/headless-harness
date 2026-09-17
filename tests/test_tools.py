@@ -3,6 +3,7 @@
 import re
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from tests.support import tools
 
@@ -58,11 +59,37 @@ class ToolContextTests(unittest.TestCase):
 
 
 class BuiltinToolTests(unittest.TestCase):
-    def test_the_catalogue_is_the_three_builtins(self):
+    def test_the_catalogue_is_the_four_builtins(self):
         self.assertEqual(
             [tool.name for tool in tools.builtin_tools],
-            ["get_current_time", "set_magic_number", "get_magic_number"],
+            ["get_system_info", "get_current_time", "set_magic_number", "get_magic_number"],
         )
+
+    def test_the_system_info_tool_reports_the_model_in_use(self):
+        state = {}
+        context = tools.ToolContext(
+            tool=tools.get_system_info_tool,
+            agent=SimpleNamespace(model="deepseek/deepseek-v4.1-flash"),
+            call_id="c",
+            arguments={},
+            raw_arguments="{}",
+            state=state,
+        )
+        text = tools.get_system_info_executor(context)
+        self.assertIn("Model: deepseek/deepseek-v4.1-flash", text)
+        self.assertIn(f"protocol version {tools.PROTOCOL_VERSION}", text)
+        self.assertEqual(state, {})
+
+    def test_the_system_info_tool_reports_an_unknown_model_without_a_block(self):
+        context = tools.ToolContext(
+            tool=tools.get_system_info_tool,
+            agent=None,
+            call_id="c",
+            arguments={},
+            raw_arguments="{}",
+            state={},
+        )
+        self.assertIn("Model: <unknown>", tools.get_system_info_executor(context))
 
     def test_the_time_tool_reports_utc_and_local(self):
         def context(state=None):

@@ -275,7 +275,7 @@ class RootAndForkTests(HHTestCase):
         self.assertEqual(root.state_deltas, {})
         self.assertEqual(
             sorted(root.tools),
-            ["get_current_time", "get_magic_number", "set_magic_number"],
+            ["get_current_time", "get_magic_number", "get_system_info", "set_magic_number"],
         )
 
     def test_root_keeps_the_id_it_is_given(self):

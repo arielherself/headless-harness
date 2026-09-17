@@ -100,6 +100,7 @@ src/server.py   HHServer — TCP listener, registry, JSONL protocol, eviction
 src/store.py    HHStore  — SQLite mirror, size budget, subtree eviction
 src/tools.py    ToolEntry / ToolContext and the builtin tools
 src/main.py     empty placeholder
+src/protocol.py the wire-protocol version shared by the server and the tools
 test.py         interactive client (gitignored: it holds the API key)
 tests/          the test-suite (see Tests above)
 docs/           this documentation

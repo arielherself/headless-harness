@@ -1,7 +1,11 @@
+import os
+import platform
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+
+from protocol import PROTOCOL_VERSION
 
 if TYPE_CHECKING:  # only for the annotation below; agent imports this module
     from agent import HHAgent
@@ -100,6 +104,30 @@ class ToolContext:
     result: str | None = None
 
 
+def get_system_info_executor(context: ToolContext, **arguments: Any) -> str:
+    # `context.agent` is the live block; a bare context (a test's) has none
+    model = getattr(context.agent, "model", "") or "<unknown>"
+    return (
+        f"Headless Harness protocol version {PROTOCOL_VERSION}\n"
+        f"OS: {platform.system()} {platform.release()} ({platform.machine()})\n"
+        f"Host: {platform.node()}\n"
+        f"Python: {platform.python_version()}\n"
+        f"CPU count: {os.cpu_count()}\n"
+        f"Model: {model}"
+    )
+
+
+get_system_info_tool = ToolEntry(
+    name="get_system_info",
+    description=(
+        "Get information about the machine the harness runs on "
+        "(OS, host, Python, CPUs, underlying model)."
+    ),
+    params=[],
+    hook=get_system_info_executor,
+)
+
+
 def get_current_time_executor(context: ToolContext, **arguments: Any) -> str:
     utc = datetime.now(timezone.utc)
     local = utc.astimezone()
@@ -147,4 +175,9 @@ get_magic_number_tool = ToolEntry(
     state_namespace="magic",
 )
 
-builtin_tools = [get_current_time_tool, set_magic_number_tool, get_magic_number_tool]
+builtin_tools = [
+    get_system_info_tool,
+    get_current_time_tool,
+    set_magic_number_tool,
+    get_magic_number_tool,
+]

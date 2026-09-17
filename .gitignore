@@ -4,3 +4,6 @@ __pycache__/
 
 /test.py
 /.commandcode/
+
+# sqlite store written by src/server.py
+/harness.db*

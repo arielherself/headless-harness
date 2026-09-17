@@ -28,7 +28,7 @@ Commands
 Events
     session_hello, command_received, command_finished, error, session_closing
     agent_created, agent_forked, agent_destroyed, agents_listed, context,
-    state, state_seeded, cancel_result, pong
+    state, state_seeded, cancel_result, pong, evicted, persist_warning
     and everything `HHAgent` emits while a block runs: turn_started,
     turn_finished, turn_failed, turn_cancelled, request_started,
     request_payload, response_received, request_finished, request_failed,
@@ -36,6 +36,14 @@ Events
     assistant_message, history_appended, tool_call_requested,
     tool_call_started, tool_call_finished, state_loaded, state_delta,
     state_discarded
+
+With `--db` the registry is mirrored to a SQLite file: a block is written when
+it is forked and again when its turn ends, so a process that dies mid-turn
+leaves the block forked-but-never-run. The API key is never written; restored
+blocks inherit the key the server was started with, and tools are stored by name
+and resolved against the catalogue on load. `--max-db-bytes` bounds the file:
+once it is exceeded, the oldest subtrees are evicted, where a subtree is a root
+tree or a block whose parent has other forks, aged by the newest block inside it.
 
 Run it with `python src/server.py`, then talk to it, e.g.
 
@@ -47,6 +55,7 @@ import importlib.util
 import json
 import pathlib
 import socketserver
+import sqlite3
 import threading
 import time
 import traceback
@@ -60,12 +69,14 @@ from agent import (
     HHAgentError,
     StateDelta,
 )
+from store import HHStore, HHStoreError
 from tools import builtin_tools
 
 PROTOCOL_VERSION = 2
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_COMMAND_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_DB_BYTES = 64 * 1024 * 1024
 
 COMMANDS: list[dict[str, Any]] = [
     {
@@ -224,6 +235,7 @@ class HHHandler(socketserver.StreamRequestHandler):
             defaults=server.describe_defaults(),
             commands=COMMANDS,
             tools=tool_catalogue(),
+            store=server.describe_store(),
         )
         try:
             while True:
@@ -278,12 +290,35 @@ class HHServer(socketserver.ThreadingTCPServer):
         self,
         address: tuple[str, int],
         defaults: dict[str, str | None] | None = None,
+        store: HHStore | None = None,
     ) -> None:
         super().__init__(address, HHHandler)
         self.defaults: dict[str, str | None] = dict(defaults or {})
         self.started_at = time.time()
         self._agents: dict[str, HHAgent] = {}
         self._registry_lock = threading.RLock()
+        self.store = store
+        self.restore_warnings: list[str] = []
+        if store is not None:
+            blocks, self.restore_warnings = store.load(
+                str(self.defaults.get("key") or "")
+            )
+            self._agents = {block.id: block for block in blocks}
+            if self._agents:
+                print(
+                    f"restored {len(self._agents)} block(s) from {store.path}",
+                    flush=True,
+                )
+            for warning in self.restore_warnings:
+                print(f"restore warning: {warning}", flush=True)
+
+    def describe_store(self) -> dict[str, Any] | None:
+        """What a client should know about persistence when it connects."""
+        if self.store is None:
+            return None
+        info: dict[str, Any] = dict(self.store.stats())
+        info["warnings"] = self.restore_warnings
+        return info
 
     def describe_defaults(self) -> dict[str, Any]:
         """What created blocks inherit; the key is never echoed back."""
@@ -407,6 +442,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             tools=sorted(block.tools),
             tool_schemas=block.tool_schemas(),
         )
+        self.persist(conn, block)
 
     def cmd_fork(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:
         parent_id = require_id(command)
@@ -452,6 +488,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             tools=sorted(child.tools),
             state_tools=child.state_tools(),
         )
+        self.persist(conn, child)
 
     def cmd_run(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:
         agent_id = require_id(command)
@@ -551,6 +588,8 @@ class HHServer(socketserver.ThreadingTCPServer):
             ]
             for block in doomed:
                 del self._agents[block.id]
+        if self.store is not None:
+            self.store.delete(agent_id)
         cancelled = [block.id for block in doomed if block.cancel()]
         conn.send(
             "agent_destroyed",
@@ -636,6 +675,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             replaced=replaced,
             keys=sorted(block.merged_state(tool)),
         )
+        self.persist(conn, block)
 
     def cmd_ping(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:
         with self._registry_lock:
@@ -652,6 +692,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             dirty=dirty,
             running=running,
             threads=threading.active_count(),
+            store=self.store.stats() if self.store else None,
         )
 
     def _run_turn(self, conn: Connection, block: HHAgent, rid: Any) -> None:
@@ -669,6 +710,9 @@ class HHServer(socketserver.ThreadingTCPServer):
             status, error, error_type = "error", str(exc), type(exc).__name__
         except Exception as exc:
             status, error, error_type = "error", str(exc), type(exc).__name__
+        # durability before the completion event: a client that sees this turn
+        # finish, then loses the process, must not lose the turn's result
+        self.persist(conn, block)
         conn.send(
             "command_finished",
             rid=rid,
@@ -683,6 +727,69 @@ class HHServer(socketserver.ThreadingTCPServer):
             context_len=len(block.context()),
             state_committed=sorted(block.state_deltas),
         )
+
+    def persist(self, conn: Connection, block: HHAgent) -> None:
+        """Mirror a block to disk, then evict if the file outgrew its budget.
+
+        A block destroyed or evicted while its turn was running is not written
+        back: re-inserting it would resurrect a subtree the caller dropped.
+        """
+        store = self.store
+        if store is None:
+            return
+        with self._registry_lock:
+            if self._agents.get(block.id) is not block:
+                return
+        dropped = store.save(block)
+        if dropped:
+            conn.send(
+                "persist_warning",
+                agent_id=block.id,
+                dropped_tools=dropped,
+                message="state for these tools could not be stored",
+            )
+        self.enforce_limit(conn)
+
+    def enforce_limit(self, conn: Connection) -> None:
+        """Drop whole subtrees, oldest first, until the file fits its budget.
+
+        Candidates come from the store; protection comes from here, because only
+        the registry knows which blocks have a turn in flight. A subtree with a
+        live turn is skipped, which makes the budget a soft bound: the file can
+        overshoot until that turn ends, and the next write tries again.
+        """
+        store = self.store
+        if store is None or store.max_bytes <= 0:
+            return
+        while store.size_bytes() > store.max_bytes:
+            running = {
+                agent_id
+                for agent_id, candidate in self._agents.items()
+                if candidate.running
+            }
+            victim: sqlite3.Row | None = None
+            victim_ids: set[str] = set()
+            for row in store.candidates():
+                ids = set(store.subtree_ids(row["root"]))
+                if ids & running:
+                    continue
+                victim, victim_ids = row, ids
+                break
+            if victim is None:
+                break  # everything left is protected; retry on the next write
+            store.delete(victim["root"])
+            with self._registry_lock:
+                for agent_id in victim_ids:
+                    self._agents.pop(agent_id, None)
+            conn.send(
+                "evicted",
+                agent_id=victim["root"],
+                dropped=sorted(victim_ids),
+                nodes=victim["nodes"],
+                newest=victim["newest"],
+                bytes=store.size_bytes(),
+                max_bytes=store.max_bytes,
+            )
 
     def block(self, agent_id: str) -> HHAgent:
         with self._registry_lock:
@@ -822,6 +929,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--endpoint", help="default provider URL for new blocks")
     parser.add_argument("--key", help="default provider key for new blocks")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--db",
+        default=str(pathlib.Path(__file__).resolve().parent.parent / "harness.db"),
+        help="SQLite file to persist blocks in",
+    )
+    parser.add_argument(
+        "--max-db-bytes",
+        type=int,
+        default=DEFAULT_MAX_DB_BYTES,
+        help="evict whole subtrees, oldest first, once the file exceeds this "
+        "(0 disables the limit)",
+    )
     args = parser.parse_args(argv)
 
     endpoint, key, source = args.endpoint, args.key, "flags"
@@ -838,13 +957,24 @@ def main(argv: list[str] | None = None) -> None:
     else:
         print(f"credentials: {source}", flush=True)
 
+    try:
+        store = HHStore(args.db, max_bytes=args.max_db_bytes)
+    except HHStoreError as exc:
+        print(f"error: {exc}", flush=True)
+        raise SystemExit(2) from exc
     server = HHServer(
         (args.host, args.port),
         defaults={"endpoint": endpoint, "key": key, "model": args.model},
+        store=store,
     )
     print(
         f"listening on {args.host}:{args.port} "
         f"(model default {args.model}, protocol {PROTOCOL_VERSION})",
+        flush=True,
+    )
+    print(
+        f"store: {args.db} ({store.size_bytes()} bytes, "
+        f"limit {args.max_db_bytes or 'none'})",
         flush=True,
     )
     try:
@@ -853,6 +983,7 @@ def main(argv: list[str] | None = None) -> None:
         print("\nshutting down", flush=True)
     finally:
         server.server_close()
+        store.close()
 
 
 if __name__ == "__main__":

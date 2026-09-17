@@ -112,6 +112,7 @@ def get_system_info_executor(context: ToolContext, **arguments: Any) -> str:
     model = getattr(context.agent, "model", "") or "<unknown>"
     return (
         f"Headless Harness protocol version {PROTOCOL_VERSION}\n"
+        f"https://github.com/arielherself/headless-harness\n"
         f"OS: {platform.system()} {platform.release()} ({platform.machine()})\n"
         f"Host: {platform.node()}\n"
         f"Python: {platform.python_version()}\n"

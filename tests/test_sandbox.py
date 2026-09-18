@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -210,6 +211,7 @@ class BubblewrapArgvTests(unittest.TestCase):
         """The argv for a spec, planned exactly the way `Sandbox.create` plans one."""
         from sandbox.sandbox import Layout, _plan_mounts
 
+        new_session = spec_kwargs.pop("new_session", True)
         spec = SandboxSpec(**spec_kwargs)
         layout = Layout(
             root=Path(self.state.name),
@@ -231,7 +233,18 @@ class BubblewrapArgvTests(unittest.TestCase):
             seccomp_fd=7,
             info_fd=8,
             block_fd=9,
+            new_session=new_session,
         )
+
+    def test_a_session_keeps_the_pty_it_was_given(self):
+        # --new-session exists to detach a sandbox from the caller's terminal.
+        # A session runs on a pty of its own — none of the harness's terminal is
+        # passed in — so it passes False, or `setsid` would take away the
+        # controlling terminal the shell needs for job control.
+        self.assertIn("--new-session", self.build())
+        session = self.build(new_session=False)
+        self.assertNotIn("--new-session", session)
+        self.assertIn("--die-with-parent", session)
 
     def test_the_namespaces_are_asked_for_explicitly(self):
         argv = self.build()
@@ -786,6 +799,84 @@ class SandboxIntegrationTests(unittest.TestCase):
         self.assertIn("/work", described["writable"])
         self.assertEqual(sandbox.exec(["/bin/sh", "-c", "echo $EXTRA"]).stdout.strip(), "value")
         self.assertTrue(sandbox.exec(["/bin/sh", "-c", "echo $HOME"]).stdout.strip())
+
+    # -- sessions -----------------------------------------------------------
+
+    def open_session(self, sandbox, command=("bash", "--norc", "-i")):
+        session = sandbox.open_session(command)
+        self.addCleanup(session.close)
+        return session
+
+    def read_until_line(self, session, expected, timeout=15.0):
+        """The session's output, up to the first line that is exactly `expected`.
+
+        A pty echoes what is typed, so "the marker appeared somewhere" is not
+        enough — the echo of the command that prints it carries the marker too.
+        Whole-line equality is what tells output apart from the echo.
+        """
+        text = ""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            chunk = session.read(timeout=0.2)
+            if chunk:
+                text += chunk.decode("utf-8", "replace")
+            if any(line.strip() == expected for line in text.splitlines()):
+                return text
+            if session.poll() is not None and not chunk:
+                break
+        self.fail(f"the session never printed a line {expected!r}; it said:\n{text}")
+
+    def test_a_session_gives_the_shell_a_terminal_and_job_control(self):
+        # the pty is the whole point of a session: without a controlling
+        # terminal a shell has neither line editing nor job control, and
+        # --new-session would detach it from the pty it was given
+        sandbox = self.create(writable=["/work"])
+        session = self.open_session(sandbox)
+        session.write("[ -t 0 ] && echo TTY=yes || echo TTY=no\n")
+        self.read_until_line(session, "TTY=yes")
+        session.write('case "$-" in *m*) echo JOB=on ;; *) echo JOB=off ;; esac\n')
+        self.read_until_line(session, "JOB=on")
+
+    def test_a_session_keeps_state_from_one_line_to_the_next(self):
+        # what exec cannot do: one process holds the namespaces for the whole
+        # session, so `cd`, exported variables and a tmpfs all survive
+        sandbox = self.create(writable=["/work", Mount.tmpfs("/scratch", "8M")])
+        session = self.open_session(sandbox)
+        session.write("cd /scratch && export WHERE=carried\n")
+        session.write('echo "$PWD $WHERE" > /scratch/where\n')
+        session.write("cat /scratch/where\n")
+        self.read_until_line(session, "/scratch carried")
+
+    def test_a_session_reports_the_status_the_shell_exits_with(self):
+        sandbox = self.create(writable=["/work"])
+        session = self.open_session(sandbox)
+        session.write("exit 7\n")
+        self.assertEqual(session.wait(timeout=15), 7)
+
+    def test_exec_refuses_while_a_session_is_open(self):
+        sandbox = self.create(writable=["/work"])
+        session = self.open_session(sandbox)
+        with self.assertRaises(SandboxError) as caught:
+            sandbox.exec(["/bin/sh", "-c", "true"])
+        self.assertIn("session", str(caught.exception))
+        # closing it hands the sandbox back
+        session.close()
+        self.assertTrue(sandbox.exec(["/bin/sh", "-c", "echo again"]).ok)
+
+    def test_destroying_a_sandbox_ends_its_session(self):
+        sandbox = self.create(writable=["/work"])
+        session = self.open_session(sandbox)
+        self.assertIsNone(session.poll())
+        sandbox.destroy()
+        self.assertIsNotNone(session.poll())
+
+    def test_a_session_starts_without_a_pid_handshake_too(self):
+        # the rlimit engine has no cgroup to place a pid in; the pty setup must
+        # not depend on which limiter is in use
+        sandbox = self.create(writable=["/work"], limits_engine="rlimit")
+        session = self.open_session(sandbox)
+        session.write("echo STARTED\n")
+        self.read_until_line(session, "STARTED")
 
 
 class SelfTestProbeTests(unittest.TestCase):

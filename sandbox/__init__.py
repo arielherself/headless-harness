@@ -63,8 +63,21 @@ reason about and has one visible consequence: host-backed writable paths persist
 between commands (they are directories the harness can also reach), while a
 tmpfs mount is created, used and discarded within the command that asked for it.
 `put_file` and `get_file` refuse a tmpfs path instead of returning a file that
-will not be there. See `sandbox/README.md` for the session-scoped alternative and
-why a seccomp filter cannot be inherited by a process that joins later.
+will not be there.
+
+`open_session` is the other model, for the one case where a single long-lived
+process is the point — an interactive shell, a language server, a REPL. One
+bubblewrap process holds the namespaces for as long as the command runs, and the
+command is given a pty of its own, so a shell keeps its state (working
+directory, environment, background jobs, a tmpfs) from one line to the next and
+has the controlling terminal that line editing and job control need:
+
+    with sandbox.open_session(["bash", "-i"]) as session:
+        session.interact()          # or write() / read() / wait()
+
+See `sandbox/session.py` for that side of the package, and `sandbox/README.md`
+for why a session is the only way to run a process in namespaces that already
+exist.
 
 Not implemented yet: `NetworkPolicy.allowing(...)`, which needs a CONNECT proxy
 outside the network namespace to have any meaning. `Sandbox.create` refuses it
@@ -77,6 +90,7 @@ that table actually holds.
 from . import limits, seccomp, toolchain
 from .limits import LimitsReport
 from .sandbox import ExecResult, Layout, Sandbox, SandboxDiskExceeded, SandboxError
+from .session import Session
 from .spec import (
     DEFAULT_HOME,
     DEFAULT_TIMEOUT,
@@ -110,6 +124,7 @@ __all__ = [
     "SandboxDiskExceeded",
     "SandboxError",
     "SandboxSpec",
+    "Session",
     "SpecError",
     "SyscallPolicy",
     "Toolchain",

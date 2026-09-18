@@ -39,6 +39,7 @@ from . import limits as limits_module
 from . import seccomp as seccomp_module
 from . import toolchain as toolchain_module
 from .bubblewrap import ResolvedMount
+from .session import Session
 from .spec import (
     DEFAULT_HOME,
     DEFAULT_TMP,
@@ -233,6 +234,7 @@ class Sandbox:
         self._file_binds = file_binds
         self._lock = threading.Lock()
         self._closed = False
+        self._session: Session | None = None
         self._budgeted = tuple(
             sorted(
                 {
@@ -391,6 +393,14 @@ class Sandbox:
             # both of these are re-checked under the lock: a destroy() may have
             # won the race while this call was on its way in
             self._check_open()
+            running = self._live_session()
+            if running is not None:
+                raise SandboxError(
+                    "this sandbox has a session open "
+                    f"(`{' '.join(running.command)}`), and its namespaces belong to "
+                    "that command until it ends: close the session, or use a second "
+                    "sandbox"
+                )
             self._refuse_when_over_budget()
             result = self._spawn(
                 command,
@@ -402,6 +412,53 @@ class Sandbox:
             )
             self._measure_disk()
         return result
+
+    def open_session(
+        self,
+        command: Sequence[str] = ("bash",),
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> Session:
+        """Start a long-lived command on a pty, in one bubblewrap process.
+
+        `exec` runs a command and waits for it, with fresh namespaces every
+        time; a session runs *until the command ends*, with the namespaces held
+        open by it. The command — an interactive shell, usually — is then the
+        parent of everything done in it, so the working directory, the
+        environment and background jobs persist from one line to the next, and
+        the mounts the spec declared (a `tmpfs` included) stay put for the
+        whole session.
+
+        The pty is what makes a shell interactive: line editing, Ctrl-C, job
+        control and window resizing all need a controlling terminal, and the
+        pty is the sandbox's own rather than the harness's. It also means the
+        session's output is a terminal stream — it echoes what is typed and
+        translates newlines — and that only one session can be open: `exec`
+        refuses while one is, because the namespaces belong to its process.
+        `resources.timeout` does not apply to a session; it ends when the
+        command does, or with `Session.close()`.
+        """
+        self._check_open()
+        command = tuple(str(part) for part in command)
+        if not command:
+            raise SandboxError("no command to run")
+        with self._lock:
+            self._check_open()
+            self._refuse_when_over_budget()
+            running = self._live_session()
+            if running is not None:
+                raise SandboxError(
+                    "this sandbox already has a session open "
+                    f"(`{' '.join(running.command)}`): its namespaces belong to that "
+                    "command until it ends — close the session, or create another "
+                    "sandbox"
+                )
+            session = self._start_session(
+                command, env=dict(env or {}), cwd=cwd or self.spec.cwd
+            )
+            self._session = session
+            return session
 
     def _spawn(
         self,
@@ -563,6 +620,130 @@ class Sandbox:
         except subprocess.TimeoutExpired:
             pass
 
+    def _start_session(
+        self, command: tuple[str, ...], *, env: Mapping[str, str], cwd: str
+    ) -> Session:
+        """`open_session`, once the lock is held: fork the pty, place the child.
+
+        The argv and the placement handshake are the same as `_spawn`'s; the
+        difference is that the child's standard streams are a pty rather than
+        pipes, so `os.forkpty` starts it instead of `subprocess.Popen`.
+        """
+        seccomp_fd = _seccomp_fd(self.program)
+        info_read = info_write = block_read = block_write = None
+        master_fd: int | None = None
+        pid: int | None = None
+        try:
+            if self.limiter.needs_placement:
+                info_read, info_write = os.pipe()
+                block_read, block_write = os.pipe()
+                # `Popen(pass_fds=...)` does this for a command; between
+                # `forkpty` and the exec there is nobody to ask, so the child's
+                # ends of the handshake are marked inheritable by hand
+                os.set_inheritable(info_write, True)
+                os.set_inheritable(block_read, True)
+            if seccomp_fd is not None:
+                os.set_inheritable(seccomp_fd, True)
+            extra = dict(env)
+            if "TERM" not in extra and os.environ.get("TERM"):
+                # `default_environment` says TERM=dumb, and a dumb terminal has
+                # no line editing; a session is the one case where borrowing
+                # the caller's terminal type is the right answer
+                extra["TERM"] = os.environ["TERM"]
+            environment = bubblewrap.default_environment(
+                self.spec, self.toolchain, _home_dir(self.mounts), extra=extra
+            )
+            argv = list(self.limiter.spawn_prefix()) + bubblewrap.build_argv(
+                spec=self.spec,
+                mounts=self.mounts,
+                file_binds=self._file_binds,
+                toolchain=self.toolchain,
+                env=environment,
+                cwd=cwd,
+                command=command,
+                seccomp_fd=seccomp_fd,
+                info_fd=info_write,
+                block_fd=block_read,
+                hostname="sandbox",
+                # the pty is the sandbox's terminal, so it must not be detached
+                # from the session that owns it (see bubblewrap.build_argv)
+                new_session=False,
+            )
+            pid, master_fd = os.forkpty()
+            if pid == 0:
+                _exec_in_pty(argv)
+            # the child holds its own copies now; a closed pipe has to mean
+            # "bwrap died" rather than "nobody wrote"
+            seccomp_fd = _close(seccomp_fd)
+            info_write = _close(info_write)
+            block_read = _close(block_read)
+            placed, failure = self._place_session(info_read, block_write, master_fd)
+            if not placed:
+                _kill_group(pid)
+                self.limiter.kill()
+                raise SandboxError(failure or "the session could not be started")
+            session = Session(self, pid, master_fd, command)
+            master_fd = None  # the session owns it now
+            return session
+        except BaseException:
+            # nothing may outlive a failed start, the same way an unplaced
+            # command is killed before its block pipe is released
+            if pid is not None:
+                _kill_group(pid)
+            raise
+        finally:
+            for fd in (seccomp_fd, info_read, info_write, block_read, block_write, master_fd):
+                _close(fd)
+
+    def _place_session(
+        self, info_read: int | None, block_write: int | None, master_fd: int | None
+    ) -> tuple[bool, str | None]:
+        """The handshake `_place` does, for a pid Python did not start.
+
+        bubblewrap reports the sandbox's real PID on the info pipe and waits on
+        the block pipe; placing that PID in its cgroup before releasing it is
+        what keeps `pids.max` and `memory.max` covering everything the session
+        will fork. If the handshake does not complete, the session is refused
+        rather than run unlimited.
+        """
+        if info_read is None or block_write is None:
+            return True, None
+        child = _read_child_pid(info_read, SETUP_TIMEOUT)
+        if child is None:
+            detail = _seen_on_pty(master_fd)
+            return False, (
+                "bwrap did not report a child pid before starting; refusing to run "
+                f"without applying limits{': ' + detail if detail else ''}"
+            )
+        try:
+            self.limiter.place(child)
+        except OSError as exc:
+            return False, f"could not place pid {child} under its limits: {exc}"
+        try:
+            os.write(block_write, b"\x01")
+        except OSError:
+            pass
+        return True, None
+
+    def _live_session(self) -> Session | None:
+        """The session still running, if any; a finished one is tidied up here."""
+        session = self._session
+        if session is None:
+            return None
+        if session.poll() is not None:
+            # a command that ended on its own still owns a pty and an entry in
+            # `_session`; close() is a no-op on the process and does both
+            session.close()
+            return None
+        return session
+
+    def _session_done(self, session: Session) -> None:
+        """Called by a `Session` that has ended, however it ended."""
+        if self._session is session:
+            self._session = None
+        if not self._closed:
+            self._measure_disk()
+
     # -- files --------------------------------------------------------------
 
     def put_file(self, path: str, data: bytes | str) -> None:
@@ -712,6 +893,9 @@ class Sandbox:
             if self._closed:
                 return
             self._closed = True
+            session, self._session = self._session, None
+            if session is not None:
+                session.close(force=True)
             self.limiter.close()
         if not keep and not os.environ.get("HH_SANDBOX_KEEP"):
             shutil.rmtree(self.layout.root, ignore_errors=True)
@@ -897,6 +1081,52 @@ def _read_child_pid(fd: int, timeout: float) -> int | None:
             break
     match = _INFO_PID_RE.search(bytes(collected))
     return int(match.group(1)) if match else None
+
+
+def _exec_in_pty(argv: list[str]) -> None:
+    """The child half of `open_session`: turn the process into bubblewrap.
+
+    Runs between `os.forkpty` and the exec, where the pty is already the
+    controlling terminal and file descriptors 0, 1 and 2 — so the only work
+    left is to replace the process. Nothing that allocates, logs or waits
+    belongs here; this side of the fork has no threads and no clean shutdown.
+    """
+    try:
+        os.execvp(argv[0], argv)
+    except BaseException as exc:  # there is nothing sensible to raise after a fork
+        try:
+            os.write(2, f"could not start {argv[0]}: {exc}\n".encode())
+        except OSError:
+            pass
+        os._exit(127)
+
+
+def _seen_on_pty(master_fd: int | None, limit: int = 8192) -> str:
+    """Whatever the child has already said on its pty, for an error message."""
+    if master_fd is None:
+        return ""
+    text = b""
+    try:
+        while len(text) < limit:
+            ready, _, _ = select.select([master_fd], [], [], 0)
+            if not ready:
+                break
+            chunk = os.read(master_fd, 4096)
+            if not chunk:
+                break
+            text += chunk
+    except OSError:
+        pass
+    stripped = text.decode("utf-8", "replace").strip()
+    return stripped.splitlines()[-1] if stripped else ""
+
+
+def _kill_group(pid: int) -> None:
+    """SIGKILL a session's process group, ignoring a group that is already gone."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _feed(stream: Any, payload: bytes) -> None:

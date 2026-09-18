@@ -111,7 +111,9 @@ def check() -> str:
     return binary
 
 
-def _namespace_args(network: NetworkPolicy, disable_userns: bool) -> list[str]:
+def _namespace_args(
+    network: NetworkPolicy, disable_userns: bool, *, new_session: bool = True
+) -> list[str]:
     args = ["--unshare-all"]
     if not network.isolated:
         # --share-net is only meaningful next to --unshare-all, which is exactly
@@ -121,7 +123,14 @@ def _namespace_args(network: NetworkPolicy, disable_userns: bool) -> list[str]:
     args.append("--unshare-user")
     if disable_userns:
         args.append("--disable-userns")
-    args += ["--die-with-parent", "--new-session", "--cap-drop", "ALL"]
+    args.append("--die-with-parent")
+    if new_session:
+        # detach from the terminal that started this. A session (see
+        # `sandbox/session.py`) is the exception: it is given a pty of its own,
+        # and `setsid` would take that terminal away from it, leaving the shell
+        # without a controlling terminal and without job control
+        args.append("--new-session")
+    args += ["--cap-drop", "ALL"]
     return args
 
 
@@ -212,12 +221,21 @@ def build_argv(
     info_fd: int | None,
     block_fd: int | None,
     hostname: str = "sandbox",
+    new_session: bool = True,
 ) -> list[str]:
-    """The full `bwrap ... -- command` argument list."""
+    """The full `bwrap ... -- command` argument list.
+
+    `new_session=False` leaves out `--new-session`, for the one caller that
+    must not have it: an interactive session, which runs its command on a pty
+    the sandbox owns. The flag detaches a sandbox from the *caller's* terminal,
+    and a session has no caller's terminal to detach from.
+    """
     if not command:
         raise BubblewrapError("no command to run")
     argv = [check()]
-    argv += _namespace_args(spec.network, spec.syscalls.disable_userns)
+    argv += _namespace_args(
+        spec.network, spec.syscalls.disable_userns, new_session=new_session
+    )
     argv += ["--hostname", hostname]
     if seccomp_fd is not None:
         argv += ["--seccomp", str(seccomp_fd)]

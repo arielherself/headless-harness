@@ -49,6 +49,11 @@ private tmpfs with things bind-mounted into it by bubblewrap.
 # talk to a sandbox directly: Nix builds the environment, then the command runs
 python -m sandbox -p python3 -p git --work ./scratch -- python3 /work/main.py
 
+# an interactive bash inside the sandbox: its own pty, so line editing, Ctrl-C
+# and job control work, and the shell's state lives as long as the session does
+python sandbox/test.py
+python sandbox/test.py --host-tools --dir ~/scratch
+
 # no Nix on this machine? build the environment from the host's own binaries
 python -m sandbox --host-tools --work ./scratch -- sh -c 'id; ls /'
 
@@ -121,12 +126,38 @@ that cannot leak state — and it has two consequences worth knowing:
   thrown away with its namespaces. `put_file` and `get_file` refuse a tmpfs path
   rather than hand back a file that will not be there.
 
-If a session ever needs scratch space that persists across commands, that is a
-change of model: keep one bubblewrap alive holding the namespaces and run each
-command inside it as a child (recursion into the mount namespace is not enough —
-a seccomp filter is inherited from the parent that installed it, not by a
-process that `setns`-es in, so the commands must be children of the sandboxed
-process, not joiners of it). It is deliberately not in this version.
+### Sessions: one process that keeps the namespaces
+
+`Sandbox.open_session(command)` is the other model, for the one case where a
+single long-lived process is the point — an interactive shell, a REPL, a
+language server:
+
+```python
+with sandbox.open_session(["bash", "-i"]) as session:
+    session.interact()          # or write() / read() / wait()
+```
+
+One bubblewrap process holds the namespaces for as long as the command runs, and
+the command is the parent of everything done in it, so the working directory,
+the environment, background jobs and `tmpfs` mounts persist from one line to the
+next. The command runs on a pty, for the same reason a shell wants one: line
+editing, Ctrl-C, `fg`/`bg` and window resizing need a controlling terminal. The
+pty is the sandbox's own — none of the harness's terminal is passed in — which
+is why a session's argv leaves out `--new-session`: that flag detaches a sandbox
+from its caller's terminal, and here the terminal is the sandbox's to keep.
+
+Two differences from `exec` are worth stating. A session has no watchdog —
+`resources.timeout` applies to commands, and a session is as long as the process
+is — and `exec` refuses while one is open, because the namespaces belong to the
+session's process until it ends. `Session.close()` ends it (SIGHUP, then SIGKILL
+and `cgroup.kill` if it does not take the hint), and `destroy()` ends it too.
+
+A command outside the session cannot be run in those namespaces either: a
+seccomp filter is inherited from the process that installed it, not by a process
+that `setns`-es in later, so anything that should share the sandbox has to be a
+child of the sandboxed process. That is exactly what typing into the shell does,
+and why `interact()` moves bytes between two terminals rather than handing over
+a file descriptor.
 
 ## Resource limits: which engine
 
@@ -168,7 +199,7 @@ The exact enforcement is worth as much as the ladder:
 /etc/resolv.conf /etc/ssl ...        the host's, but only when the network is shared
 /proc        a private instance for the PID namespace
 /dev         bubblewrap's minimal device set; /dev/shm is a sized tmpfs
-/tmp         sized tmpfs (per command)
+/tmp         sized tmpfs (per command; per session, in a session)
 /work /home/user / whatever `writable` names   host directories, read-write
 read-only files from `files=`   bound in one file at a time
 ```
@@ -249,7 +280,7 @@ path and a cgroup; running a command is one `bwrap` process.
 ## Testing
 
 ```bash
-python -m unittest tests.test_sandbox -v      # 82 tests
+python -m unittest tests.test_sandbox -v      # 89 tests
 python -m sandbox --self-test                 # what this machine really enforces
 ```
 

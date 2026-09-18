@@ -179,7 +179,7 @@ class IdAndParsingTests(unittest.TestCase):
         tool = server_tool("wrong", wrong)
         reply, error = agent._run_hook(tool, self._hook_context(tool))
         self.assertEqual(error, "bad_result")
-        self.assertIn("expected a string or ToolResult", reply.text)
+        self.assertIn("expected a string, ToolResult or ToolCall", reply.text)
 
     def test_run_hook_rejects_bad_images_in_a_tool_result(self):
         def wrong(context):
@@ -1771,6 +1771,632 @@ class LocalToolTests(HHTestCase):
         self.assertEqual(child.tool_schemas()[0]["function"]["name"], "ask_operator")
 
 
+# --- tool pipes ----------------------------------------------------------
+
+
+class ToolPipeTests(HHTestCase):
+    """A tool may answer with a call; the harness runs it before the model."""
+
+    def test_only_the_last_call_of_a_pipe_reaches_the_model(self):
+        written = []
+
+        def download(context, name):
+            return tools.ToolCall(
+                "write_file", {"path": f"/workspace/{name}", "data": "A" * 64}
+            )
+
+        def write_file(context, path, data):
+            written.append((path, data))
+            return f"wrote {len(data)} bytes to {path}"
+
+        self.provider.script(
+            Response.tool_call("download", {"name": "secret.bin"}, "c1"),
+            Response.text("done"),
+        )
+        block = self.root(
+            tools=[
+                server_tool("download", download, params=[param("name")]),
+                server_tool(
+                    "write_file", write_file, params=[param("path"), param("data")]
+                ),
+            ],
+        ).fork("fetch it")
+        thread = self.turn(block)
+        thread.join()
+        self.assertIsNone(thread.error)
+
+        # the piped tool ran with the arguments the model never saw
+        self.assertEqual(written, [("/workspace/secret.bin", "A" * 64)])
+        # the tool message names the chain and carries the last result alone
+        self.assertEqual(
+            block.messages[2]["content"],
+            "[tool pipe] download -> write_file\n"
+            "wrote 64 bytes to /workspace/secret.bin",
+        )
+        # the intermediate value went to the record, not to the provider
+        self.assertNotIn("A" * 64, json.dumps(self.provider.last_payload()))
+        self.assertEqual(
+            block.messages[2],
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": block.messages[2]["content"],
+            },
+        )
+
+        # events: the model's call is announced as always, the piped call is
+        # announced as a step of a pipe, and both are attributed to c1
+        self.assertEqual(thread.last("tool_call_requested")["name"], "download")
+        started = thread.last("pipe_step_started")
+        self.assertEqual(started["name"], "write_file")
+        self.assertEqual(started["call_id"], "c1:pipe:1")
+        self.assertEqual(started["parent_call_id"], "c1")
+        self.assertEqual(started["step"], 1)
+        self.assertEqual(started["chain"], ["download", "write_file"])
+        self.assertEqual(started["via"], "server")
+        self.assertTrue(started["known"])
+        finished = thread.last("pipe_step_finished")
+        self.assertTrue(finished["ok"])
+        self.assertEqual(finished["text"], "wrote 64 bytes to /workspace/secret.bin")
+        self.assertIsNone(finished["next"])
+        outer = thread.last("tool_call_finished")
+        self.assertTrue(outer["ok"])
+        self.assertEqual(outer["chain"], ["download", "write_file"])
+        self.assertEqual(outer["steps"], 1)
+        self.assertIn("[tool pipe] download -> write_file", outer["result"])
+
+        # the trace holds every step's own arguments and result
+        self.assertEqual(len(block.pipe_traces), 1)
+        trace = block.pipe_traces[0]
+        self.assertEqual(trace["call_id"], "c1")
+        self.assertEqual(trace["round"], 1)
+        self.assertEqual(trace["chain"], ["download", "write_file"])
+        self.assertTrue(trace["ok"])
+        self.assertEqual(
+            [step["name"] for step in trace["steps"]], ["download", "write_file"]
+        )
+        self.assertEqual(trace["steps"][0]["arguments"], {"name": "secret.bin"})
+        self.assertEqual(trace["steps"][0]["next"], "write_file")
+        self.assertEqual(trace["steps"][1]["call_id"], "c1:pipe:1")
+        self.assertEqual(trace["steps"][1]["arguments"]["data"], "A" * 64)
+        self.assertEqual(trace["steps"][1]["via"], "server")
+
+    def test_a_step_may_leave_a_note_that_only_the_trace_keeps(self):
+        def download(context, name):
+            return tools.ToolResult(
+                f"downloaded {name} (10 bytes)",
+                call=tools.ToolCall("write_file", {"path": name, "data": "x" * 10}),
+            )
+
+        def write_file(context, path, data):
+            return f"wrote {data}"
+
+        self.provider.script(
+            Response.tool_call("download", {"name": "f.bin"}),
+            Response.text("done"),
+        )
+        block = self.root(
+            tools=[
+                server_tool("download", download, params=[param("name")]),
+                server_tool(
+                    "write_file", write_file, params=[param("path"), param("data")]
+                ),
+            ]
+        ).fork("fetch it")
+        self.run_turn(block)
+        self.assertEqual(
+            block.messages[2]["content"], "[tool pipe] download -> write_file\nwrote xxxxxxxxxx"
+        )
+        trace = block.pipe_traces[0]
+        self.assertEqual(trace["steps"][0]["text"], "downloaded f.bin (10 bytes)")
+
+    def test_a_pipe_may_run_through_three_tools(self):
+        def first(context, value):
+            return tools.ToolCall("second", {"value": value + 1})
+
+        def second(context, value):
+            return tools.ToolCall("third", {"value": value * 2})
+
+        def third(context, value):
+            return f"value is {value}"
+
+        tools_ = [
+            server_tool(name, hook, params=[param("value")])
+            for name, hook in (("first", first), ("second", second), ("third", third))
+        ]
+        self.provider.script(
+            Response.tool_call("first", {"value": 1}, "c1"),
+            Response.text("done"),
+        )
+        block = self.root(tools=tools_).fork("go")
+        thread = self.turn(block)
+        thread.join()
+        self.assertEqual(block.messages[2]["content"], "[tool pipe] first -> second -> third\nvalue is 4")
+        self.assertEqual(
+            [event["chain"] for event in pick(thread.events, "pipe_step_started")],
+            [["first", "second"], ["first", "second", "third"]],
+        )
+        # the calls after the model's own are numbered c1:pipe:1 and c1:pipe:2
+        self.assertEqual(
+            [event["call_id"] for event in pick(thread.events, "pipe_step_started")],
+            ["c1:pipe:1", "c1:pipe:2"],
+        )
+        self.assertEqual(thread.last("tool_call_finished")["steps"], 2)
+        self.assertEqual(thread.last("turn_finished")["pipe_steps"], 2)
+        trace = block.pipe_traces[0]
+        self.assertEqual(
+            [step["next"] for step in trace["steps"]],
+            ["second", "third", None],
+        )
+        self.assertEqual(trace["result"], "value is 4")
+
+    def test_a_server_tool_may_pipe_to_a_local_tool(self):
+        def fetch(context, url):
+            return tools.ToolCall("ask_operator", {"question": f"what is at {url}?"})
+
+        self.provider.script(
+            Response.tool_call("fetch", {"url": "https://x.test"}, "c1"),
+            Response.text("ok"),
+        )
+        block = self.root(
+            tools=[
+                server_tool("fetch", fetch, params=[param("url")]),
+                local_tool("ask_operator", params=[param("question")]),
+            ]
+        ).fork("fetch it")
+        thread = self.turn(block)
+        called = thread.wait_event("local_tool_called")
+        self.assertEqual(called["name"], "ask_operator")
+        self.assertEqual(called["call_id"], "c1:pipe:1")
+        self.assertEqual(called["parent_call_id"], "c1")
+        self.assertEqual(called["step"], 1)
+        self.assertEqual(called["chain"], ["fetch", "ask_operator"])
+        self.assertEqual(called["arguments"], {"question": "what is at https://x.test?"})
+        self.assertEqual(block.pending_calls(), ["c1:pipe:1"])
+
+        self.assertTrue(block.resolve_local_call("c1:pipe:1", "an operator says hi"))
+        thread.join()
+        self.assertIsNone(thread.error)
+        self.assertEqual(
+            block.messages[2]["content"],
+            "[tool pipe] fetch -> ask_operator\nan operator says hi",
+        )
+        # the local step is reported like any other local call, plus where it
+        # came from
+        resolved = thread.last("local_tool_resolved")
+        self.assertEqual(resolved["kind"], "call")
+        self.assertEqual(resolved["next"], None)
+        step = thread.last("pipe_step_finished")
+        self.assertEqual(step["name"], "ask_operator")
+        self.assertEqual(step["via"], "client")
+        self.assertTrue(step["ok"])
+
+    def test_a_local_tool_may_answer_with_a_call_of_its_own(self):
+        written = []
+
+        def write_file(context, path, data):
+            written.append((path, data))
+            return f"{path} holds {len(data)} bytes"
+
+        self.provider.script(
+            Response.tool_calls([("fetch_file", {"url": "https://x.test/f"}, "c1")]),
+            Response.text("thanks"),
+        )
+        block = self.root(
+            tools=[
+                local_tool("fetch_file", params=[param("url")]),
+                server_tool(
+                    "write_file", write_file, params=[param("path"), param("data")]
+                ),
+            ]
+        ).fork("fetch it")
+        thread = self.turn(block)
+        thread.wait_event("local_tool_called", call_id="c1")
+        self.assertTrue(
+            block.resolve_local_call(
+                "c1",
+                "fetched 128 bytes",
+                call=tools.ToolCall(
+                    "write_file", {"path": "/workspace/f", "data": "B" * 128}
+                ),
+            )
+        )
+        thread.join()
+        self.assertIsNone(thread.error)
+        self.assertEqual(written, [("/workspace/f", "B" * 128)])
+        self.assertEqual(
+            block.messages[2]["content"],
+            "[tool pipe] fetch_file -> write_file\n/workspace/f holds 128 bytes",
+        )
+        # the bytes crossed the client's own connection, never the provider's
+        self.assertNotIn("B" * 128, json.dumps(self.provider.last_payload()))
+        self.assertEqual(thread.last("local_tool_resolved")["next"], "write_file")
+        self.assertEqual(
+            block.pipe_traces[0]["steps"][0]["text"], "fetched 128 bytes"
+        )
+
+    def test_an_error_answer_ends_the_pipe(self):
+        def fetch(context, url):
+            return tools.ToolCall("ask_operator", {"question": url})
+
+        self.provider.script(
+            Response.tool_call("fetch", {"url": "x://y"}, "c1"),
+            Response.text("ok then"),
+        )
+        block = self.root(
+            tools=[
+                server_tool("fetch", fetch, params=[param("url")]),
+                local_tool("ask_operator", params=[param("question")]),
+            ]
+        ).fork("fetch it")
+        thread = self.turn(block)
+        thread.wait_event("local_tool_called")
+        block.resolve_local_call("c1:pipe:1", "the operator is away", error="operator_away")
+        thread.join()
+        finished = thread.last("tool_call_finished")
+        self.assertFalse(finished["ok"])
+        self.assertEqual(finished["error"], "operator_away")
+        self.assertEqual(
+            block.messages[2]["content"],
+            "[tool pipe] fetch -> ask_operator\nthe operator is away",
+        )
+
+    def test_a_pipe_to_an_unknown_tool_is_reported_to_the_model(self):
+        def orphan(context):
+            return tools.ToolCall("nowhere", {"a": 1})
+
+        self.provider.script(
+            Response.tool_call("orphan", {}, "c1"),
+            Response.text("ok"),
+        )
+        block = self.root(tools=[server_tool("orphan", orphan)]).fork("go")
+        thread = self.turn(block)
+        thread.join()
+        self.assertIsNone(thread.error)
+        self.assertEqual(
+            block.messages[2]["content"],
+            "[tool pipe] orphan -> nowhere\nError: unknown tool 'nowhere'",
+        )
+        started = thread.last("pipe_step_started")
+        self.assertFalse(started["known"])
+        finished = thread.last("tool_call_finished")
+        self.assertEqual(finished["error"], "unknown_tool")
+        step = thread.last("pipe_step_finished")
+        self.assertFalse(step["ok"])
+        self.assertEqual(step["error"], "unknown_tool")
+
+    def test_a_pipe_that_never_ends_is_cut_off(self):
+        calls = []
+
+        def loop(context, n):
+            calls.append(n)
+            return tools.ToolCall("loop", {"n": n + 1})
+
+        self.provider.script(
+            Response.tool_call("loop", {"n": 1}, "c1"),
+            Response.text("ok"),
+        )
+        block = self.root(
+            tools=[server_tool("loop", loop, params=[param("n")])]
+        ).fork("loop forever")
+        thread = self.turn(block)
+        thread.join()
+        # the model's own call plus the bounded number of piped ones
+        self.assertEqual(len(calls), agent.MAX_PIPE_DEPTH + 1)
+        self.assertIsNone(thread.error)
+        finished = thread.last("tool_call_finished")
+        self.assertEqual(finished["error"], "pipe_depth")
+        self.assertIn(
+            f"stopped after {agent.MAX_PIPE_DEPTH} steps",
+            block.messages[2]["content"],
+        )
+        self.assertEqual(finished["steps"], agent.MAX_PIPE_DEPTH)
+        # the cut-off shows the chain it got through, and the trace records it
+        self.assertEqual(
+            block.pipe_traces[0]["chain"],
+            ["loop"] * (agent.MAX_PIPE_DEPTH + 1),
+        )
+
+    def test_the_last_call_of_a_pipe_may_return_images(self):
+        data_uri = "data:image/png;base64,AAAA"
+
+        def fetch(context):
+            return tools.ToolCall("screenshot", {})
+
+        def screenshot(context):
+            return tools.ToolResult("screen attached", images=[data_uri])
+
+        self.provider.script(
+            Response.tool_call("fetch", {}, "c1"),
+            Response.text("nice"),
+        )
+        block = self.root(
+            tools=[server_tool("fetch", fetch), server_tool("screenshot", screenshot)]
+        ).fork("go")
+        thread = self.turn(block)
+        thread.join()
+        self.assertIsNone(thread.error)
+        self.assertEqual(
+            block.messages[2]["content"],
+            [
+                {"type": "text", "text": "[tool pipe] fetch -> screenshot\nscreen attached"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        )
+        finished = thread.last("tool_call_finished")
+        self.assertEqual(finished["image_count"], 1)
+        self.assertEqual(
+            finished["result"], "[tool pipe] fetch -> screenshot\nscreen attached"
+        )
+
+    def test_a_malformed_pipe_call_is_reported_as_a_bad_result(self):
+        cases = {
+            "nameless": tools.ToolResult(call=tools.ToolCall("")),
+            "not_a_call": tools.ToolResult(call={"name": "fine"}),
+            "with_images": tools.ToolResult(
+                call=tools.ToolCall("fine"),
+                images=["data:image/png;base64,AAAA"],
+            ),
+            "bad_arguments": tools.ToolResult(call=tools.ToolCall("fine", ["a"])),
+        }
+        for label, returned in cases.items():
+            with self.subTest(case=label):
+                self.provider.script(
+                    Response.tool_call("bad", {}, "c1"),
+                    Response.text("ok"),
+                )
+                block = self.root(
+                    tools=[
+                        server_tool("bad", lambda context: returned),
+                        server_tool("fine", lambda context: "fine"),
+                    ]
+                ).fork("go")
+                thread = self.turn(block)
+                thread.join()
+                self.assertIsNone(thread.error)
+                finished = thread.last("tool_call_finished")
+                self.assertFalse(finished["ok"])
+                self.assertEqual(finished["error"], "bad_result")
+                self.assertIn("Error: tool 'bad' returned", finished["result"])
+                self.assertEqual(pick(thread.events, "pipe_step_started"), [])
+                self.assertEqual(block.pipe_traces, [])
+
+    def test_a_huge_intermediate_value_is_bounded_in_the_trace(self):
+        payload = "C" * (agent.PIPE_VALUE_MAX_CHARS + 1000)
+
+        def fetch(context):
+            return tools.ToolCall("write_file", {"path": "/f", "data": payload})
+
+        def write_file(context, path, data):
+            return f"wrote {len(data)}"
+
+        self.provider.script(
+            Response.tool_call("fetch", {}, "c1"),
+            Response.text("ok"),
+        )
+        block = self.root(
+            tools=[
+                server_tool("fetch", fetch),
+                server_tool(
+                    "write_file", write_file, params=[param("path"), param("data")]
+                ),
+            ]
+        ).fork("go")
+        thread = self.turn(block)
+        thread.join()
+        data = block.pipe_traces[0]["steps"][1]["arguments"]["data"]
+        self.assertLess(len(data), agent.PIPE_VALUE_MAX_CHARS + 200)
+        self.assertIn("+1000 chars", data)
+        self.assertIn("sha256", data)
+        self.assertNotIn(payload, json.dumps(block.pipe_traces))
+        # the event carries the same bounded rendering, never the value
+        self.assertEqual(
+            thread.last("pipe_step_started")["arguments"]["data"], data
+        )
+        # the final text reports the true size, because the tool saw it whole
+        self.assertEqual(thread.last("tool_call_finished")["result"], "[tool pipe] fetch -> write_file\nwrote 5096")
+
+    def test_bytes_in_a_pipe_are_recorded_without_being_sent(self):
+        def fetch(context):
+            return tools.ToolCall("copy", {"raw": b"\x00\x01binary"})
+
+        def copy(context, raw):
+            return f"got {len(raw)} bytes"
+
+        self.provider.script(
+            Response.tool_call("fetch", {}, "c1"),
+            Response.text("ok"),
+        )
+        block = self.root(
+            tools=[
+                server_tool("fetch", fetch),
+                server_tool("copy", copy, params=[param("raw")]),
+            ]
+        ).fork("go")
+        self.run_turn(block)
+        recorded = block.pipe_traces[0]["steps"][1]["arguments"]["raw"]
+        self.assertIn("8 bytes", recorded)
+        self.assertIn("sha256", recorded)
+        self.assertEqual(block.messages[2]["content"], "[tool pipe] fetch -> copy\ngot 8 bytes")
+
+    def test_the_context_carries_the_tool_registry(self):
+        seen = {}
+
+        def inspect_tools(context):
+            seen["names"] = sorted(context.tools)
+            seen["params"] = [p.name for p in context.tools["write_file"].params]
+            seen["is_local"] = context.tools["ask_operator"].is_local
+            seen["copy"] = context.tools.copy  # a copy, not the live registry
+            return "inspected"
+
+        self.provider.script(
+            Response.tool_call("inspect_tools", {}, "c1"),
+            Response.text("ok"),
+        )
+        block = self.root(
+            tools=[
+                server_tool("inspect_tools", inspect_tools),
+                server_tool(
+                    "write_file",
+                    lambda context, path, data: "x",
+                    params=[param("path"), param("data")],
+                ),
+                local_tool("ask_operator"),
+            ]
+        ).fork("go")
+        self.run_turn(block)
+        self.assertEqual(seen["names"], ["ask_operator", "inspect_tools", "write_file"])
+        self.assertEqual(seen["params"], ["path", "data"])
+        self.assertTrue(seen["is_local"])
+
+    def test_a_local_answer_cannot_mix_a_call_with_an_error_or_images(self):
+        self.provider.script(
+            Response.tool_calls([("ask_operator", {}, "c1")]),
+            Response.text("ok"),
+        )
+        block = self.root(tools=[local_tool("ask_operator")]).fork("ask")
+        thread = self.turn(block)
+        thread.wait_event("local_tool_called")
+        for kwargs, message in (
+            (
+                {"error": "nope", "call": tools.ToolCall("ask_operator")},
+                "both an error and a call",
+            ),
+            (
+                {
+                    "images": ["data:image/png;base64,AAAA"],
+                    "call": tools.ToolCall("ask_operator"),
+                },
+                "both a call and images",
+            ),
+            ({"call": {"name": "ask_operator"}}, "'call' must be a ToolCall"),
+            ({"call": tools.ToolCall("")}, "non-empty 'name'"),
+        ):
+            with self.subTest(kwargs=sorted(kwargs)):
+                with self.assertRaises(agent.HHAgentError) as caught:
+                    block.resolve_local_call("c1", "x", **kwargs)
+                self.assertIn(message, str(caught.exception))
+                # a rejected answer leaves the call parked, so it can be retried
+                self.assertEqual(block.pending_calls(), ["c1"])
+        block.resolve_local_call("c1", "fine")
+        thread.join()
+        self.assertIsNone(thread.error)
+        self.assertEqual(block.messages[2]["content"], "fine")
+
+    def test_a_call_in_a_rollback_answer_goes_nowhere(self):
+        self.provider.script(
+            Response.tool_calls([("ask_operator", {}, "c1")]),
+            Response.error(500),
+            Response.text("summary"),
+        )
+        block = self.root(tools=[local_tool("ask_operator", rollback=True)]).fork("ask")
+        thread = self.turn(block)
+        thread.wait_event("local_tool_called", call_id="c1")
+        block.resolve_local_call("c1", "the answer")
+        thread.wait_event("local_tool_rollback", call_id="c1:rollback")
+        # an undo is a report; a call sent with its answer is not a pipe
+        self.assertTrue(
+            block.resolve_local_call(
+                "c1:rollback", "undone", call=tools.ToolCall("ask_operator")
+            )
+        )
+        thread.join()
+        self.assertEqual(block.outcome, "failed")
+        self.assertEqual(pick(thread.events, "pipe_step_started"), [])
+        self.assertEqual(block.pipe_traces, [])
+        self.assertEqual(thread.last("rollback_finished")["result"], "undone")
+        self.assertIsNone(thread.last("local_tool_resolved")["next"])
+
+    def test_a_turn_that_fails_rolls_back_every_step_of_its_pipe(self):
+        undone = []
+
+        def first(context, name):
+            return tools.ToolCall("second", {"name": name})
+
+        def second(context, name):
+            return f"second handled {name}"
+
+        def first_rollback(context, name):
+            undone.append(("first", name, context.result))
+            return "undone first"
+
+        def second_rollback(context, name):
+            undone.append(("second", name, context.result))
+            return "undone second"
+
+        self.provider.script(
+            Response.tool_call("first", {"name": "x"}, "c1"),
+            Response.error(500, b"the turn dies here"),
+            Response.text("it was piping"),
+        )
+        block = self.root(
+            tools=[
+                server_tool(
+                    "first",
+                    first,
+                    params=[param("name")],
+                    rollback=first_rollback,
+                    external_effects=True,
+                ),
+                server_tool(
+                    "second",
+                    second,
+                    params=[param("name")],
+                    rollback=second_rollback,
+                    external_effects=True,
+                ),
+            ]
+        ).fork("pipe, then die")
+        thread = self.turn(block)
+        thread.join()
+        self.assertEqual(block.outcome, "failed")
+        self.assertEqual(
+            undone,
+            [
+                ("second", "x", "second handled x"),
+                ("first", "x", ""),  # the step that piped returned no text
+            ],
+        )
+        self.assertEqual(
+            [event["call_id"] for event in pick(thread.events, "rollback_finished")],
+            ["c1:pipe:1", "c1"],
+        )
+        note = block.messages[-1]["content"]
+        self.assertIn("Undone: second, first", note)
+
+    def test_pipe_traces_stay_out_of_the_context_and_of_other_blocks(self):
+        def fetch(context):
+            return tools.ToolCall("write_file", {"path": "/f", "data": "D" * 32})
+
+        def write_file(context, path, data):
+            return f"wrote {len(data)}"
+
+        self.provider.script(
+            Response.tool_call("fetch", {}, "c1"),
+            Response.text("done"),
+        )
+        root = self.root(
+            tools=[
+                server_tool("fetch", fetch),
+                server_tool(
+                    "write_file", write_file, params=[param("path"), param("data")]
+                ),
+            ]
+        )
+        first = root.fork("fetch it")
+        self.run_turn(first)
+        self.assertEqual(len(first.pipe_traces), 1)
+
+        # a fork from the block starts with its own, empty record
+        self.provider.script(Response.text("hello"))
+        second = first.fork("hi")
+        self.run_turn(second)
+        self.assertEqual(second.pipe_traces, [])
+        # the chain's context is messages only: the trace is not part of it
+        self.assertNotIn("D" * 32, json.dumps(second.context()))
+        self.assertNotIn("pipe_traces", json.dumps(second.context()))
+
+
 # --- rollback ------------------------------------------------------------
 
 
@@ -1872,6 +2498,27 @@ class RollbackTests(HHTestCase):
         self.assertIn("Undone: install.", note)
         self.assertEqual(block.outcome, "failed")  # the turn keeps its own failure
         self.assertIn("500", block.error)
+
+    def test_a_rollback_that_returns_a_non_string_is_reported(self):
+        def hook(context, package):
+            return f"installed {package}"
+
+        def rollback(context, package):
+            return tools.ToolCall("install", {"package": package})
+
+        tool = server_tool("install", hook, params=[param("package")], rollback=rollback)
+        self.provider.script(
+            Response.tool_call("install", {"package": "x"}),
+            Response.error(500),
+            Response.text("summary"),
+        )
+        block = self.root(tools=[tool]).fork("install")
+        thread = self.turn(block)
+        thread.join()
+        finished = thread.last("rollback_finished")
+        self.assertFalse(finished["ok"])
+        self.assertEqual(finished["error"], "bad_result")
+        self.assertIn("expected a string", finished["result"])
 
     def test_a_rollback_with_bad_arguments_is_reported(self):
         def hook(context, package):

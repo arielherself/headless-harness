@@ -29,7 +29,7 @@ add_tool = ToolEntry(
 | `name` | what the model calls; also the default state namespace |
 | `description` | shown to the model — this is prompt text, so write it well |
 | `params` | `ToolParam(name, type, description)`; every one is sent as `required` |
-| `hook` | `hook(context, **arguments) -> str`, or a `ToolResult` when it returns images |
+| `hook` | `hook(context, **arguments) -> str`, or a `ToolResult` / `ToolCall` when it returns images or pipes (see below) |
 | `state_namespace` | where the tool's state lives; empty means its own name (see below) |
 
 The hook is always called with the context first and the model's arguments as
@@ -60,6 +60,71 @@ go into the model's tool message. A malformed `ToolResult` (a bad image, a local
 path, non-string text) comes back to the model as a `bad_result` error and the
 turn continues.
 
+### Piping into another tool
+
+A hook's third answer is a `ToolCall`: run this other tool first, and only tell
+the model what *that* one says.
+
+```python
+from tools import ToolCall, ToolResult
+
+
+def fetch_executor(context: ToolContext, url: str) -> ToolResult:
+    path, data = download(url)
+    return ToolResult(
+        f"downloaded {len(data)} bytes",          # for the record, not the model
+        call=ToolCall("write_file", {
+            "sandbox_id": context.state["sandbox"],
+            "path": path,
+            "data": data,                          # bytes, never quoted by a model
+        }),
+    )
+
+
+def write_file_executor(context: ToolContext, sandbox_id: str, path: str, data: bytes) -> str:
+    put_file(sandbox_id, path, data)              # what the previous call piped over
+    return f"wrote {path} ({len(data)} bytes)"    # the only text the model sees
+```
+
+Returning a `ToolCall` on its own is the same thing with no note. The harness runs
+the named tool — server-side or, if it has no hook, by asking the client — and
+follows whatever *it* returns, until a call answers with text. A pipe may mix the
+two freely.
+
+**The model sees the ends, never the middle.** The tool message becomes the chain
+of names plus the last result:
+
+```
+[tool pipe] fetch -> write_file
+wrote /workspace/photo.jpg (184320 bytes)
+```
+
+The intermediate arguments and results are recorded on the block (`get_context`
+returns them as `pipe_traces`) and reported through `pipe_step_started` /
+`pipe_step_finished` events, but they are never sent to the provider — which is
+the whole point, since that is where a base64 file or a megabyte of HTML would
+otherwise cost tokens. Long values are stored bounded (a prefix, the true length
+and a `sha256` prefix), so inspecting a pipe never bloats the database either.
+
+What a piping hook needs to know:
+
+- **`context.tools` is the registry** — every tool the block offers, by name,
+  with the params each expects. Check it before piping: a name that is not there
+  still runs, but comes back as `unknown tool 'x'` in the model's result. Editing
+  the mapping changes nothing.
+- **A pipe is bounded to 16 calls** (`MAX_PIPE_DEPTH`). Hitting the limit is not a
+  turn failure: the model gets `Error: tool pipe from 'x' stopped after 16 steps`
+  and `error: "pipe_depth"` on `tool_call_finished`.
+- **Only the last call may return images.** A `ToolResult` that carries both a
+  `call` and `images` is a `bad_result` — the earlier images would have nowhere to
+  go. Text on a piping `ToolResult` is for the trace only, so it can be as
+  detailed as you like about what the step did.
+- **Every step is a call of its own.** It is rolled back with the turn, newest
+  first, and `context.result` in a rollback hook is that step's own text — which
+  for a piping call is its note, not the final answer.
+- **Piped arguments are arbitrary Python values.** They only have to survive
+  being passed to the next hook; the recorded form is bounded and JSON-shaped.
+
 Register it by adding it to `builtin_tools` at the bottom of `tools.py`. Clients
 then choose which tools a block gets:
 
@@ -81,6 +146,7 @@ then choose which tools a block gets:
 | `arguments` | the decoded arguments dict |
 | `raw_arguments` | exactly what the model sent, before decoding |
 | `state` | this namespace's memory, already overlaid with its ancestors' deltas |
+| `tools` | every tool this block offers, by name — the registry a piping hook inspects |
 
 ## Persistent state
 
@@ -163,7 +229,8 @@ an `error` code.
 | `unknown_tool` | the model called a name that is not registered |
 | `bad_arguments` | the arguments were not a JSON object, or did not bind to the hook's parameters (`TypeError`) |
 | `tool_raised` | the hook raised anything else |
-| `bad_result` | the hook returned something that was not a string or `ToolResult`, or a `ToolResult` whose images were malformed |
+| `bad_result` | the hook returned something that was not a string, `ToolResult` or `ToolCall`; a `ToolResult` whose images were malformed; or a pipe call with no name, non-object arguments, or images on a step that piped |
+| `pipe_depth` | the pipe reached `MAX_PIPE_DEPTH` calls and was cut off |
 
 Do not signal failure by raising for control flow; return a string the model can
 act on. Either way the turn continues — a failing tool never aborts a
@@ -263,8 +330,9 @@ because their implementation is somewhere else entirely:
 The model sees them exactly like a builtin. When one is called the server emits
 `local_tool_called` and waits for a `resolve_tool` command with the result, which
 becomes the tool message on the next request. In the library, that wait is
-`HHAgent.resolve_local_call(call_id, result, error=None)`, called from whatever
-thread can answer.
+`HHAgent.resolve_local_call(call_id, result, error=None)` — with `images=` for
+images, and `call=ToolCall(...)` to pipe into another tool instead of ending the
+call — called from whatever thread can answer.
 
 `ToolEntry(name=..., description=..., params=..., hook=None)` builds one in code;
 `tool.is_local` is true for it. The rest of this document applies as usual, with
@@ -363,7 +431,8 @@ them rather than letting the next model assume the environment is clean.
 
 - [ ] `description` reads well to a model, and says when *not* to use the tool.
 - [ ] Parameters are described individually; they are all marked required.
-- [ ] The hook returns a string that stands on its own — the model sees nothing else.
+- [ ] The hook returns a string that stands on its own — unless it pipes, in which case only the last call's result is read.
+- [ ] A pipe is bounded: check `context.tools` before naming a target, and keep the chain short.
 - [ ] State is flat, JSON-shaped where practical, and free of unpicklable values.
 - [ ] If another tool needs the same memory, both declare the same `state_namespace`.
 - [ ] Re-running the turn is safe, because a failed turn commits no state.

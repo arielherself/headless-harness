@@ -98,7 +98,7 @@ protocol, the registry, persistence and eviction; `tests/test_store.py` and
 src/agent.py    HHAgent — one block of the chain; provider calls; state deltas
 src/server.py   HHServer — TCP listener, registry, JSONL protocol, eviction
 src/store.py    HHStore  — SQLite mirror, size budget, subtree eviction
-src/tools.py    ToolEntry / ToolContext / ToolResult and the builtin tools
+src/tools.py    ToolEntry / ToolContext / ToolResult / ToolCall and the builtin tools
 src/sandbox_tools.py  the live-sandbox registry behind the `nix_*` tools
 src/main.py     empty placeholder
 src/protocol.py the wire-protocol version shared by the server and the tools
@@ -141,6 +141,15 @@ it does not implement, only describes. The model sees them like any other, and
 when one is called the server emits `local_tool_called` and parks that turn until
 the client answers with `resolve_tool`. The wait holds no lock and no database
 transaction, so the rest of the server keeps working while a client decides.
+
+**And a tool can hand off to another.** A hook may answer with a `ToolCall`
+instead of text — as may a client answering `resolve_tool` — and the harness runs
+that tool next, following the chain until one of them returns text. Only the
+tools the pipe called and the *last* call's output reach the model; every
+intermediate argument and result stays in the block's `pipe_traces`, for
+inspection but never for the transcript. That is what lets a download tool hand
+its bytes straight to `nix_add_file` without the model ever quoting a base64
+payload.
 
 **And a turn that fails can undo itself.** A tool may declare a `rollback` hook —
 or, if it runs on the client, promise that the client has one — and when a turn

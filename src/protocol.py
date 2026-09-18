@@ -6,4 +6,4 @@ tools and the server need has to live below `tools`: a constant defined in
 This module imports nothing, which is what lets it sit under all of them.
 """
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4

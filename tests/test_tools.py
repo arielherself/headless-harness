@@ -61,6 +61,24 @@ class ToolContextTests(unittest.TestCase):
         self.assertEqual(context.raw_arguments, '{"a": 1}')
         self.assertEqual(context.call_id, "c1")
         self.assertEqual(context.state, {})
+        # a bare context has no registry; the harness hands one to every hook
+        self.assertEqual(context.tools, {})
+
+
+class ToolCallTests(unittest.TestCase):
+    def test_a_tool_call_names_a_tool_and_its_arguments(self):
+        call = tools.ToolCall("write_file", {"path": "/workspace/f", "data": b"bytes"})
+        self.assertEqual(call.name, "write_file")
+        self.assertEqual(call.arguments["data"], b"bytes")
+        # arguments are optional, and each call gets its own dict
+        self.assertEqual(tools.ToolCall("alone").arguments, {})
+        self.assertIsNot(tools.ToolCall("a").arguments, tools.ToolCall("b").arguments)
+
+    def test_a_tool_result_carries_text_images_and_a_next_call(self):
+        empty = tools.ToolResult()
+        self.assertEqual((empty.text, empty.images, empty.call), ("", (), None))
+        call = tools.ToolCall("next", {"a": 1})
+        self.assertIs(tools.ToolResult("a note", call=call).call, call)
 
 
 class BuiltinToolTests(unittest.TestCase):

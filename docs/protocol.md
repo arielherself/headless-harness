@@ -1,7 +1,7 @@
 # Protocol
 
 The server speaks **newline-delimited JSON over TCP**: one JSON object per line,
-in both directions, UTF-8. Default `127.0.0.1:8765`, protocol version `3`.
+in both directions, UTF-8. Default `127.0.0.1:8765`, protocol version `4`.
 
 A line longer than 8 MiB is rejected with `command_too_large` and the connection
 closes. The server binds to loopback by default and has no authentication — it is
@@ -195,7 +195,8 @@ landmine for the next turn.
 
 → `context` (`depth`, `path`, `context` — the flattened messages that would be
 sent, `context_len`, `local_len` — how many of them this block owns, `messages` —
-this block's own list).
+this block's own list, `pipe_traces` — one record per tool pipe this block's own
+turn ran, see [Tool pipes](#tool-pipes)).
 
 ### `get_state` / `set_state`
 
@@ -238,7 +239,8 @@ Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `outcome`
 `error`, `prompt_chars`, `prompt_preview`, `image_count`, `text_chars`,
 `local_len`, `context_len`, `model`, `summary_model`, `tools`, `local_tools`,
 `state_namespaces`, `waiting_on` (local calls this block is parked on),
-`max_tokens`, `include_usage`, `verbose`, `created_at`, `age_ms`.
+`pipe_traces` (how many this block's own turn ran), `max_tokens`, `include_usage`,
+`verbose`, `created_at`, `age_ms`.
 
 ### `destroy_agent`
 
@@ -262,18 +264,22 @@ running block**, unlike `set_state`: the block being parked is the whole point.
 |---|---|
 | `id` | **required** — the block whose turn is waiting, from the event |
 | `call_id` | **required** — from the `local_tool_called` event |
-| `result` | the text handed back to the model; a non-string is JSON-encoded; optional when `images` is given |
+| `result` | the text handed back to the model; a non-string is JSON-encoded; optional when `images` or `call` is given |
 | `images` | optional list of http(s) URLs or data:image/... URIs the tool returned (see [Images](#images)) |
 | `error` | optional; marks the call failed and is reported to the model as such |
+| `call` | optional `{name, arguments}` for the tool to run next, continuing a [pipe](#tool-pipes); cannot be combined with `error` or `images` |
 
-→ `local_tool_answered` (`call_id`, `ok`, `result_chars`, `image_count`), and the
-parked turn resumes. The images become part of the tool message the model sees,
-the same way a fork's images become part of the user message; an answer that
-carries `error` stays text and its images, if any, are dropped.
+→ `local_tool_answered` (`call_id`, `ok`, `result_chars`, `image_count`, `next` —
+the tool a piped `call` names, null otherwise), and the parked turn resumes. The
+images become part of the tool message the model sees, the same way a fork's
+images become part of the user message; an answer that carries `error` stays text
+and its images, if any, are dropped.
 
-Errors: `bad_id`, `unknown_agent`, `bad_field`, `unknown_call` — nothing is
-waiting on that id any more (it timed out, was cancelled, or never existed), and
-`detail.pending` lists what is still outstanding.
+Errors: `bad_id`, `unknown_agent`, `bad_field`, `bad_call` — the `call` was not
+`{name, arguments}` with a non-empty name, or it was combined with `error` or
+`images` — and `unknown_call`: nothing is waiting on that id any more (it timed
+out, was cancelled, or never existed), with `detail.pending` listing what is still
+outstanding. A rejected answer leaves the call parked, so it can be retried.
 
 ### `ping`
 
@@ -312,7 +318,7 @@ unreadable row).
 | `context` | see the command above |
 | `state` | see the command above |
 | `state_seeded` | see the command above |
-| `local_tool_answered` | `rid`, `agent_id`, `call_id`, `ok`, `result_chars`, `image_count` |
+| `local_tool_answered` | `rid`, `agent_id`, `call_id`, `ok`, `result_chars`, `image_count`, `next` |
 | `pong` | see the command above |
 | `error` | `code`, `message`, `rid`, `command`, plus a case-specific `detail`; `internal_error` adds `traceback`, `bad_json` adds `line`, `command_too_large` adds `bytes`, `unknown_command` adds `commands` |
 
@@ -321,7 +327,7 @@ unreadable row).
 | Event | Fields |
 |---|---|
 | `turn_started` | `prompt`, `prompt_chars`, `image_count`, `depth`, `path`, `model`, `tools`, `context_len`, `max_tokens`, `include_usage`, `verbose` |
-| `turn_finished` | `text`, `text_chars`, `rounds`, `tool_calls`, `elapsed_ms`, `messages`, `context_len`, `dirty: false` |
+| `turn_finished` | `text`, `text_chars`, `rounds`, `tool_calls` (the model's own), `pipe_steps` (calls tools added by piping), `elapsed_ms`, `messages`, `context_len`, `dirty: false` |
 | `turn_failed` | `error`, `error_type`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
 | `turn_cancelled` | `error`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
 
@@ -356,20 +362,23 @@ requests tools is followed by another round until the model answers with text.
 |---|---|
 | `tool_call_requested` | `round`, `call_id`, `name`, `raw_arguments`, `known` |
 | `tool_call_started` | `round`, `call_id`, `name` |
-| `tool_call_finished` | `round`, `call_id`, `name`, `ok`, `error`, `result` (the text), `result_chars`, `image_count`, `elapsed_ms` |
+| `tool_call_finished` | `round`, `call_id`, `name`, `ok`, `error`, `result` (the text), `result_chars`, `image_count`, `elapsed_ms`, plus `chain` and `steps` when the call piped |
+| `pipe_step_started` | `round`, `call_id` (the step's own, `<call_id>:pipe:<n>`), `parent_call_id` (the model's call), `step`, `name`, `via` (`server` / `client`), `known`, `arguments` (bounded), `chain` |
+| `pipe_step_finished` | the same, plus `ok`, `error`, `text` (bounded), `text_chars`, `image_count`, `next` (the tool it piped to, or null), `elapsed_ms` |
 
 `error` is a code, not a message: `unknown_tool`, `bad_arguments`, `tool_raised`,
-`bad_result`, `timeout`, or `no_hook`. A tool that fails still produces a result,
-which is fed back to the model so it can correct itself.
+`bad_result`, `pipe_depth` (the pipe hit its step limit), `timeout`, or `no_hook`.
+A tool that fails still produces a result, which is fed back to the model so it
+can correct itself.
 
 Calls to a **local tool** — one this client declared — announce themselves
 instead of running:
 
 | Event | Fields |
 |---|---|
-| `local_tool_called` | `round`, `call_id`, `name`, `kind` (`call`), `arguments`, `raw_arguments`, `timeout_ms` — the turn is now parked on this |
+| `local_tool_called` | `round`, `call_id`, `name`, `kind` (`call`), `arguments`, `raw_arguments`, `timeout_ms` — the turn is now parked on this; a piped step adds `parent_call_id`, `step` and `chain` |
 | `local_tool_rollback` | `call_id` (of the undo), `name`, `kind` (`rollback`), `rollback_of`, `arguments`, `result`, `call_ok`, `timeout_ms` |
-| `local_tool_resolved` | `call_id`, `name`, `kind`, `ok`, `error`, `result` (the text), `result_chars`, `image_count`, `waited_ms` |
+| `local_tool_resolved` | `call_id`, `name`, `kind`, `ok`, `error`, `result` (the text), `result_chars`, `image_count`, `next` (the tool a piped answer named, or null), `waited_ms` |
 | `local_tool_unresolved` | `call_id`, `name`, `kind`, `reason` (`timeout` / `cancelled`), `waited_ms` |
 
 `kind` distinguishes a call the model asked for from an undo the harness is asking
@@ -434,6 +443,88 @@ Things to know:
   server, so such a tool keeps its own memory; forking rewinds builtin state but
   not a client's private memory.
 - **`cancel` releases a parked turn**, reporting `reason: "cancelled"`.
+
+## Tool pipes
+
+A tool normally answers with text. A **server-side hook** may instead return a
+`ToolCall` (or a `ToolResult` carrying one), and a **local tool** may answer
+`resolve_tool` with `call`; either way the harness runs that call next, before the
+model is consulted again, and keeps following calls until one returns text. A pipe
+may run through any mix of server-run and client-run tools.
+
+All of this arrived in protocol `4`: a `3` server does not know `resolve_tool`'s
+`call` (without a `result` it answers `bad_field`, with one it quietly drops the
+call), and it never sends the `pipe_step_*` events or `pipe_traces`. Check
+`session_hello.protocol` before piping to an unknown server.
+
+The point is what the model does **not** see. Only the tools the pipe called and
+the *last* call's output become the tool message:
+
+```
+[tool pipe] tg_download_file_to_sandbox -> nix_add_file
+wrote /workspace/photo.jpg (184320 bytes)
+```
+
+Everything in between — the arguments each step was given, what it returned and
+when — is recorded on the block and reported through events, but never sent to the
+provider. A client can therefore download a file and pipe its bytes into
+`nix_add_file` without the model ever quoting a base64 payload.
+
+A server hook does it in code:
+
+```python
+def download_executor(context: ToolContext, url: str) -> ToolResult:
+    path, data = fetch(url)
+    return ToolResult(
+        f"downloaded {len(data)} bytes",     # for the trace, not the model
+        call=ToolCall("nix_add_file", {
+            "sandbox_id": context.state["sandbox"],
+            "path": path,
+            "content_base64": base64.b64encode(data).decode("ascii"),
+        }),
+    )
+```
+
+...or a client, answering a local call:
+
+```jsonc
+→ {"command":"resolve_tool","id":"a1","call_id":"call_1",
+   "call":{"name":"nix_add_file","arguments":{"sandbox_id":"sbx-7f",
+            "path":"/workspace/photo.jpg","content_base64":"…"}}}
+← {"event":"local_tool_answered","call_id":"call_1","ok":true,"next":"nix_add_file"}
+← {"event":"pipe_step_started","call_id":"call_1:pipe:1","parent_call_id":"call_1",
+   "step":1,"name":"nix_add_file","via":"server","known":true,
+   "chain":["tg_download_file_to_sandbox","nix_add_file"],"arguments":{"sandbox_id":"sbx-7f",…}}
+← {"event":"pipe_step_finished","call_id":"call_1:pipe:1","name":"nix_add_file",
+   "ok":true,"error":null,"text":"wrote /workspace/photo.jpg (184320 bytes)","next":null,…}
+← {"event":"tool_call_finished","call_id":"call_1","name":"tg_download_file_to_sandbox",
+   "ok":true,"chain":["tg_download_file_to_sandbox","nix_add_file"],"steps":1,
+   "result":"[tool pipe] tg_download_file_to_sandbox -> nix_add_file\nwrote /workspace/photo.jpg (184320 bytes)"}
+```
+
+Rules worth knowing:
+
+- **Each step gets a derived `call_id`**: `<the model's call id>:pipe:<n>`, numbered
+  from 1. It is what a piped local call is answered with, and what a rollback of
+  that step reports.
+- **A pipe is bounded** to `MAX_PIPE_DEPTH` (16) calls. Hitting the limit is not a
+  turn failure: the model gets an explanatory result with `error: "pipe_depth"`.
+- **An unknown piped tool** is the same: the model is told `unknown tool 'x'` and
+  the turn continues. `pipe_step_started.known` says so up front.
+- **Only the last call may return images.** A step that both pipes and returns
+  images is a `bad_result`; so is a call with no name or with non-object
+  arguments.
+- **Intermediate values are recorded bounded**, not whole: a string over
+  `PIPE_VALUE_MAX_CHARS` (4096) is kept as a prefix plus `+n chars` and a
+  `sha256` prefix, and bytes as a size and digest. `get_context` returns the
+  records as `pipe_traces`, each holding `call_id`, `round`, `chain`, `ok`,
+  `error`, `result`, `result_chars`, `elapsed_ms` and one `steps` entry per call
+  (`call_id`, `name`, `via`, `arguments`, `ok`, `error`, `text`, `text_chars`,
+  `image_count`, `next`, `elapsed_ms`).
+- **Every step rolls back with the turn.** A failed, cancelled or abandoned turn
+  offers each call it made an undo, the pipe's steps included, newest first.
+- **A client's piped `call` travels over this connection**, so the 8 MiB command
+  limit applies to it; a server-side pipe has no such limit.
 
 ## Rollback
 
@@ -535,7 +626,8 @@ client-run in its definition — or the note will quietly leave them out.
 | `bad_id` | `id` / `new_id` missing or not a non-empty string |
 | `bad_prompt` | `prompt` missing or empty |
 | `bad_image` | `images` was malformed: not a list, an entry without a non-empty `url`, or a non-string `detail` |
-| `bad_result` | a tool hook returned something other than a string or `ToolResult`, or a `ToolResult` whose images were malformed |
+| `bad_result` | a tool hook returned something other than a string, `ToolResult` or `ToolCall`, a `ToolResult` whose images were malformed, or a pipe `call` that was unusable |
+| `bad_call` | `resolve_tool`'s `call` was not `{name, arguments}`, or it came with `error` or `images` |
 | `bad_field` | a field had the wrong type or value |
 | `bad_tools` | `tools` / `local_tools` was malformed, or a name is declared twice |
 | `unknown_tool` | a name is not in the catalogue |
@@ -574,6 +666,11 @@ the file can exceed `--max-db-bytes` until that turn ends.
 lock and no database transaction is held, so every connection stays fully
 serviceable — writes included. A call with no answer inside `local_timeout` does
 not fail the turn; the model is told the tool produced an error and can react.
+
+**A pipe is invisible to the model except at its ends.** The tools it called and
+the last call's output appear in the tool message; every intermediate argument and
+result stays on the block. A turn that fails rolls back each step like any other
+call.
 
 **Durability precedes the completion event.** When you see a turn's
 `command_finished`, its result is already on disk if the server was started with

@@ -1,5 +1,7 @@
 import copy
+import hashlib
 import json
+import math
 import threading
 import time
 import uuid
@@ -9,7 +11,7 @@ from typing import Any, Self
 
 import requests
 
-from tools import ToolContext, ToolEntry, ToolResult, builtin_tools
+from tools import ToolCall, ToolContext, ToolEntry, ToolResult, builtin_tools
 
 # Must be a model the provider serves over the OpenAI chat/completions shape;
 # the `claude-*` models are rejected here and only accept /v1/messages.
@@ -18,6 +20,16 @@ DEFAULT_TIMEOUT = 120.0
 # how long a turn waits for a client to answer a local tool call
 DEFAULT_LOCAL_TIMEOUT = 120.0
 MAX_TOOL_ROUNDS = 120
+# How many calls one tool's pipe may add before it is cut off. A pipe is a
+# tool's own business and runs without the model in the loop, so the bound is
+# what keeps a tool that pipes to itself from spinning forever.
+MAX_PIPE_DEPTH = 16
+# A pipe's intermediate values are recorded for inspection, never sent to the
+# provider, so they are bounded rather than stored whole: a base64 file would
+# otherwise sit in the database once per step that handled it.
+PIPE_VALUE_MAX_CHARS = 4096
+# how deep into a nested argument the bounded rendering goes before giving up
+PIPE_VALUE_MAX_DEPTH = 6
 
 # The default model takes max_tokens in [1, 393216], so the default cap is its own
 # maximum output. A block may override it; `0` sends no cap at all and leaves the
@@ -192,6 +204,73 @@ def _parse_arguments(name: str, raw_arguments: Any) -> tuple[Any, str | None]:
     return {}, None
 
 
+def _check_call(call: ToolCall) -> ToolCall:
+    """Check a pipe call's shape, returning it with a plain dict of arguments.
+
+    Shape only: whether the name is a registered tool is decided when the call
+    runs, where an unknown one can be reported to the model like any other
+    unknown tool rather than failing the hook that asked for it.
+    """
+    if not isinstance(call.name, str) or not call.name:
+        raise HHAgentError("a tool call needs a non-empty 'name'")
+    if not isinstance(call.arguments, Mapping):
+        raise HHAgentError(f"tool call '{call.name}' needs its arguments as an object")
+    try:
+        arguments = dict(call.arguments)
+    except Exception as exc:  # a mapping that will not copy
+        raise HHAgentError(
+            f"tool call '{call.name}' has unusable arguments: {exc}"
+        ) from exc
+    return ToolCall(name=call.name, arguments=arguments)
+
+
+def _bounded(
+    value: Any,
+    limit: int = PIPE_VALUE_MAX_CHARS,
+    depth: int = PIPE_VALUE_MAX_DEPTH,
+) -> Any:
+    """A JSON-safe, size-bounded rendering of a value, for traces and events.
+
+    Only a pipe's intermediate values go through this: the model never sees
+    them, and a step may legitimately carry something enormous (a file's bytes),
+    so what is kept is a preview plus its true size and a digest, never the
+    whole thing. Everything comes back as JSON primitives, which is what lets a
+    trace be stored in a block and sent over the wire unchanged.
+    """
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        # NaN and the infinities are not JSON, so they are rendered as text
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, str):
+        if len(value) <= limit:
+            return value
+        digest = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+        return (
+            f"{value[:limit]}\u2026[+{len(value) - limit} chars, "
+            f"sha256 {digest[:16]}]"
+        )
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return f"<{len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:16]}>"
+    if depth <= 0:
+        return (
+            f"<{type(value).__name__} nested deeper than "
+            f"{PIPE_VALUE_MAX_DEPTH} levels>"
+        )
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bounded(item, limit, depth - 1) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_bounded(item, limit, depth - 1) for item in value]
+    try:
+        rendered = repr(value)[:limit]
+    except Exception:  # a repr that raises is still not a reason to fail a turn
+        rendered = "<unprintable>"
+    return f"<{type(value).__name__}: {rendered}>"
+
+
 def _run_hook(tool: ToolEntry, context: ToolContext) -> tuple["_ToolReply", str | None]:
     """Run a tool hook: returns its reply and why it failed."""
     hook = tool.hook
@@ -241,6 +320,8 @@ class _Pending:
     error: str | None = None
     # already-normalized image parts from the client's answer
     images: list[dict[str, Any]] = field(default_factory=list)
+    # a next call, when the client answered with one instead of ending the pipe
+    call: ToolCall | None = None
 
 
 @dataclass
@@ -264,29 +345,75 @@ class _ToolReply:
     # the text alone, for events, failure notes and rollback reports
     text: str = ""
     image_count: int = 0
+    # the normalized parts `content` was built from, so a pipe can rebuild the
+    # message with its own header in front
+    parts: tuple[dict[str, Any], ...] = ()
+    # set when this reply is not the end of the pipe: the call to run next
+    call: ToolCall | None = None
 
 
 def _reply(text: str, parts: Iterable[dict[str, Any]] = ()) -> _ToolReply:
     """A reply built from text and already-normalized image parts."""
-    parts = list(parts)
+    parts = tuple(parts)
     return _ToolReply(
         content=content_with_images(text, parts),
         text=text,
         image_count=len(parts),
+        parts=parts,
     )
 
 
 def _tool_reply(returned: Any) -> _ToolReply:
-    """Normalize whatever a hook returned: a string, or a `ToolResult`."""
+    """Normalize whatever a hook returned: a string, `ToolResult` or `ToolCall`."""
+    if isinstance(returned, ToolCall):
+        returned = ToolResult(call=returned)
     if isinstance(returned, ToolResult):
         if not isinstance(returned.text, str):
             raise HHAgentError("returned a ToolResult whose text is not a string")
-        return _reply(returned.text, image_content_parts(returned.images))
+        if returned.call is None:
+            return _reply(returned.text, image_content_parts(returned.images))
+        if not isinstance(returned.call, ToolCall):
+            raise HHAgentError("returned a ToolResult whose call is not a ToolCall")
+        try:
+            call = _check_call(returned.call)
+        except HHAgentError as exc:
+            raise HHAgentError(f"returned an unusable tool call: {exc}") from exc
+        if returned.images:
+            raise HHAgentError(
+                "returned both a pipe call and images; only the last call of a "
+                "pipe may return images"
+            )
+        return _ToolReply(text=returned.text, call=call)
     if isinstance(returned, str):
         return _reply(returned)
     raise HHAgentError(
-        f"returned {type(returned).__name__}, expected a string or ToolResult"
+        f"returned {type(returned).__name__}, expected a string, ToolResult or ToolCall"
     )
+
+
+def _step_record(
+    call_id: str,
+    name: str,
+    via: str,
+    arguments: Any,
+    reply: _ToolReply,
+    error: str | None,
+    elapsed_ms: float,
+) -> dict[str, Any]:
+    """One call inside a pipe, as the trace and the step events report it."""
+    return {
+        "call_id": call_id,
+        "name": name,
+        "via": via,
+        "arguments": _bounded(arguments),
+        "ok": error is None,
+        "error": error,
+        "text": _bounded(reply.text),
+        "text_chars": len(reply.text),
+        "image_count": reply.image_count,
+        "next": reply.call.name if reply.call is not None else None,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 @dataclass
@@ -378,6 +505,12 @@ class HHAgent:
     block is refused, since its context is still growing. Only a turn that
     finished commits state deltas, so a tool's memory never advances through a
     failure, a cancellation, or an abandoned generator.
+
+    A tool may also answer with a call instead of text, and the harness runs it
+    before the model is consulted again: a **pipe**. Only the tools the pipe
+    called and the last call's output are shown to the model; every step's
+    arguments and result stay in `pipe_traces`, and each step is recorded as a
+    call of its own, so a failed turn can undo them all, newest first.
     """
 
     id: str
@@ -405,6 +538,9 @@ class HHAgent:
     on_event: EventHook | None
     # keyed by namespace: a tool's `state_namespace`, or its name when unset
     state_deltas: dict[str, StateDelta]
+    # one record per pipe this block's own turn ran, for inspection and for
+    # `get_context`; the model never sees any of it (see `_run_call`)
+    pipe_traces: list[dict[str, Any]]
     _cancel: threading.Event
     _run_lock: threading.Lock
     _live_states: dict[str, dict[str, Any]]
@@ -473,6 +609,7 @@ class HHAgent:
         self.created_at = time.time()
         self.on_event = None
         self.state_deltas = {}
+        self.pipe_traces = []
         self._cancel = threading.Event()
         self._run_lock = threading.Lock()
         self._live_states = {}
@@ -679,6 +816,7 @@ class HHAgent:
         result: str,
         error: str | None = None,
         images: Any = None,
+        call: ToolCall | None = None,
     ) -> bool:
         """Hand a client's answer to the turn that is waiting for it.
 
@@ -686,17 +824,36 @@ class HHAgent:
         bad one raises before the waiting turn is woken. An answer that reports
         an `error` is text: images sent with it are dropped.
 
+        `call`, when given, is a `ToolCall` the client's tool wants run next, so
+        the answer continues a pipe instead of ending it. It cannot be combined
+        with `error` (which ends the pipe) or with `images` (which only the last
+        call of a pipe may carry). A rejected answer leaves the call parked, so
+        the client can answer again.
+
         Returns False when nothing is waiting on that id any more — the call
         timed out, was cancelled, or never existed. The turn is woken by the
         event and reads the answer on its own thread.
         """
+        if call is not None:
+            if not isinstance(call, ToolCall):
+                raise HHAgentError("'call' must be a ToolCall")
+            call = _check_call(call)
+            if error is not None:
+                raise HHAgentError(
+                    "a local tool answer cannot be both an error and a call"
+                )
         parts = image_content_parts(images)
+        if call is not None and parts:
+            raise HHAgentError(
+                "a local tool answer cannot carry both a call and images"
+            )
         pending = self._pending.get(call_id)
         if pending is None:
             return False
         pending.result = result
         pending.error = error
         pending.images = parts
+        pending.call = call
         pending.event.set()
         return True
 
@@ -708,15 +865,27 @@ class HHAgent:
         raw: Any,
         hook: EventHook | None,
         round_no: int,
+        pipe: dict[str, Any] | None = None,
     ) -> tuple[_ToolReply, str | None]:
-        """Announce a client-side tool call, then wait for the answer."""
+        """Announce a client-side tool call, then wait for the answer.
+
+        `pipe`, when given, says this call is a step of a pipe rather than the
+        model's own call: `parent_call_id`, `step` and `chain` go out with the
+        event so the client can see where the call came from, and the client may
+        answer with a `call` of its own to keep the pipe going.
+        """
         return self._ask_client(
             hook,
             "local_tool_called",
             call_id,
             tool.name,
             "call",
-            {"round": round_no, "arguments": arguments, "raw_arguments": raw},
+            {
+                "round": round_no,
+                "arguments": arguments,
+                "raw_arguments": raw,
+                **(pipe or {}),
+            },
             self.local_timeout,
             "timeout",
             stop_on_cancel=True,
@@ -810,6 +979,11 @@ class HHAgent:
                 result=text,
                 result_chars=len(text),
                 image_count=len(pending.images),
+                next=(
+                    pending.call.name
+                    if kind == "call" and pending.call is not None
+                    else None
+                ),
                 waited_ms=self._ms(started),
             )
             if pending.error is not None:
@@ -818,7 +992,12 @@ class HHAgent:
                     _reply(text or f"Error: local tool '{name}': {pending.error}"),
                     pending.error,
                 )
-            return _reply(text, pending.images), None
+            reply = _reply(text, pending.images)
+            if kind == "call":
+                # only a forward call can continue a pipe: an undo's answer is a
+                # report, so a call sent with one goes nowhere
+                reply.call = pending.call
+            return reply, None
         finally:
             self._pending.pop(call_id, None)
 
@@ -1128,9 +1307,10 @@ class HHAgent:
             # `state_discarded` report this same turn is about to emit
             state=copy.deepcopy(self._live_states.get(tool.namespace, {})),
             result=call.result,
+            tools=dict(self.tools),
         )
         try:
-            return rollback(context, **call.arguments), None
+            returned = rollback(context, **call.arguments)
         except TypeError as exc:
             return (
                 f"Error: rollback for '{tool.name}' had bad arguments: {exc}",
@@ -1140,6 +1320,15 @@ class HHAgent:
             # warned and ignored: the remaining rollbacks must still run
             failure = f"{type(exc).__name__}: {exc}"
             return (f"Error: rollback for '{tool.name}' raised {failure}", "rollback_raised")
+        if isinstance(returned, str):
+            return returned, None
+        # an undo reports what it did; it cannot itself pipe, so anything else
+        # is a bug worth naming rather than a value to store
+        return (
+            f"Error: rollback for '{tool.name}' returned "
+            f"{type(returned).__name__}, expected a string",
+            "bad_result",
+        )
 
     def cancel(self) -> bool:
         """Ask the running turn to stop, returning whether one was running.
@@ -1296,6 +1485,9 @@ class HHAgent:
             text_chars=len(self.text),
             rounds=rounds,
             tool_calls=tool_calls,
+            # calls the model asked for are counted above; these are the ones
+            # the tools added themselves by piping
+            pipe_steps=sum(len(trace["steps"]) - 1 for trace in self.pipe_traces),
             elapsed_ms=self._ms(started),
             messages=len(self.messages),
             context_len=len(self.context()),
@@ -1528,100 +1720,231 @@ class HHAgent:
         self, calls: list[dict[str, Any]], hook: EventHook | None, round_no: int
     ) -> list[dict[str, Any]]:
         """Execute requested tool calls and build the matching tool messages."""
-        results: list[dict[str, Any]] = []
-        for call in calls:
-            function = call.get("function") or {}
-            name = function.get("name", "")
-            raw = function.get("arguments")
-            call_id = call.get("id", "")
-            self._emit(
-                hook,
-                "tool_call_requested",
-                round=round_no,
-                call_id=call_id,
-                name=name,
-                raw_arguments=raw,
-                known=name in self.tools,
+        return [self._run_call(call, hook, round_no) for call in calls]
+
+    def _run_call(
+        self, call: dict[str, Any], hook: EventHook | None, round_no: int
+    ) -> dict[str, Any]:
+        """Run one model-requested call, following any pipe it starts.
+
+        A tool answers with text, which ends the call, or with a `ToolCall`,
+        which becomes the next step of a *pipe*: the harness runs that call and
+        carries on until one of them returns text. Only the tools the pipe
+        called and the last call's output reach the model; each step's own
+        arguments and result are kept in `pipe_traces` and reported through
+        events, so they can be inspected without ever entering the transcript.
+
+        Every step is also a `_Call` of its own, recorded as it runs, so a turn
+        that does not commit offers each of them an undo, newest first.
+        """
+        function = call.get("function") or {}
+        name = function.get("name", "")
+        raw = function.get("arguments")
+        call_id = call.get("id", "")
+        self._emit(
+            hook,
+            "tool_call_requested",
+            round=round_no,
+            call_id=call_id,
+            name=name,
+            raw_arguments=raw,
+            known=name in self.tools,
+        )
+        self._emit(
+            hook, "tool_call_started", round=round_no, call_id=call_id, name=name
+        )
+        started = time.monotonic()
+        # the checks keep the order they always had: a name nobody knows is
+        # reported as such even when its arguments are junk too
+        arguments: Any = {}
+        if name not in self.tools:
+            reply, error, via = (
+                _reply(f"Error: unknown tool '{name}'"),
+                "unknown_tool",
+                "server",
             )
-            self._emit(
-                hook,
-                "tool_call_started",
-                round=round_no,
-                call_id=call_id,
-                name=name,
-            )
-            started = time.monotonic()
-            tool = self.tools.get(name)
-            if tool is None:
-                reply, error = _reply(f"Error: unknown tool '{name}'"), "unknown_tool"
+        else:
+            arguments, parse_error = _parse_arguments(name, raw)
+            if parse_error is not None:
+                reply, error, via = _reply(parse_error), "bad_arguments", "server"
+            elif not isinstance(arguments, dict):
+                reply, error, via = (
+                    _reply(f"Error: arguments for '{name}' must be a JSON object"),
+                    "bad_arguments",
+                    "server",
+                )
             else:
-                arguments, parse_error = _parse_arguments(name, raw)
-                if parse_error is not None:
-                    reply, error = _reply(parse_error), "bad_arguments"
-                elif not isinstance(arguments, dict):
-                    reply, error = (
-                        _reply(f"Error: arguments for '{name}' must be a JSON object"),
-                        "bad_arguments",
-                    )
-                elif tool.is_local:
-                    # no hook and no state on this side: the client runs it
-                    # recorded before asking, because a client may run a tool and
-                    # then fail to answer — a cancelled or timed-out call still
-                    # needs its undo offered
-                    call = _Call(tool, call_id, arguments, raw, "", False)
-                    self._called.append(call)
-                    reply, error = self._answer_local(
-                        tool, call_id, arguments, raw, hook, round_no
-                    )
-                    call.result, call.ok = reply.text, error is None
-                else:
-                    context = ToolContext(
-                        tool=tool,
-                        agent=self,
-                        call_id=call_id,
-                        arguments=arguments,
-                        raw_arguments=raw,
-                        state=self._live_state(tool.namespace),
-                    )
-                    self._emit(
-                        hook,
-                        "state_loaded",
-                        round=round_no,
-                        call_id=call_id,
-                        tool=name,
-                        state_namespace=tool.namespace,
-                        keys=sorted(context.state),
-                        inherited=len(self._state_bases.get(tool.namespace) or {}),
-                    )
-                    reply, error = _run_hook(tool, context)
-                    if error not in NOT_RUN:
-                        self._called.append(
-                            _Call(
-                                tool,
-                                call_id,
-                                arguments,
-                                raw,
-                                reply.text,
-                                error is None,
-                            )
-                        )
+                reply, error, via = self._invoke(
+                    name, arguments, raw, call_id, hook, round_no, {}
+                )
+        # the trace keeps the model's own call as step 0 and every piped call
+        # after it, in the order they ran
+        steps = [
+            _step_record(
+                call_id,
+                name,
+                via,
+                arguments if isinstance(arguments, dict) else {},
+                reply,
+                error,
+                self._ms(started),
+            )
+        ]
+        while error is None and reply.call is not None:
+            if len(steps) > MAX_PIPE_DEPTH:
+                # the pipe's own calls are not the model's turns, so the guard
+                # is here: a tool that keeps asking for itself must still end
+                reply, error = (
+                    _reply(
+                        f"Error: tool pipe from '{name}' stopped after "
+                        f"{MAX_PIPE_DEPTH} steps"
+                    ),
+                    "pipe_depth",
+                )
+                break
+            step_call = reply.call
+            step_no = len(steps)
+            chain = [step["name"] for step in steps] + [step_call.name]
+            step_id = f"{call_id}:pipe:{step_no}"
+            pipe = {"parent_call_id": call_id, "step": step_no, "chain": chain}
+            step_tool = self.tools.get(step_call.name)
+            step_via = (
+                "client"
+                if step_tool is not None and step_tool.is_local
+                else "server"
+            )
+            step_started = time.monotonic()
             self._emit(
                 hook,
-                "tool_call_finished",
+                "pipe_step_started",
                 round=round_no,
-                call_id=call_id,
-                name=name,
-                ok=error is None,
-                error=error,
-                result=reply.text,
-                result_chars=len(reply.text),
-                image_count=reply.image_count,
-                elapsed_ms=self._ms(started),
+                call_id=step_id,
+                name=step_call.name,
+                via=step_via,
+                known=step_tool is not None,
+                arguments=_bounded(step_call.arguments),
+                **pipe,
             )
-            results.append(
-                {"role": "tool", "tool_call_id": call_id, "content": reply.content}
+            step_reply, step_error, step_via = self._invoke(
+                step_call.name,
+                step_call.arguments,
+                step_call.arguments,
+                step_id,
+                hook,
+                round_no,
+                pipe,
             )
-        return results
+            steps.append(
+                _step_record(
+                    step_id,
+                    step_call.name,
+                    step_via,
+                    step_call.arguments,
+                    step_reply,
+                    step_error,
+                    self._ms(step_started),
+                )
+            )
+            self._emit(
+                hook, "pipe_step_finished", round=round_no, **steps[-1], **pipe
+            )
+            reply, error = step_reply, step_error
+        extra: dict[str, Any] = {}
+        if len(steps) > 1:
+            chain = [step["name"] for step in steps]
+            header = f"[tool pipe] {' -> '.join(chain)}"
+            text = f"{header}\n{reply.text}" if reply.text else header
+            content = content_with_images(text, reply.parts)
+            self.pipe_traces.append(
+                {
+                    "call_id": call_id,
+                    "round": round_no,
+                    "chain": chain,
+                    "ok": error is None,
+                    "error": error,
+                    "result": _bounded(reply.text),
+                    "result_chars": len(reply.text),
+                    "steps": steps,
+                    "elapsed_ms": self._ms(started),
+                }
+            )
+            extra = {"chain": chain, "steps": len(steps) - 1}
+        else:
+            text, content = reply.text, reply.content
+        self._emit(
+            hook,
+            "tool_call_finished",
+            round=round_no,
+            call_id=call_id,
+            name=name,
+            ok=error is None,
+            error=error,
+            result=text,
+            result_chars=len(text),
+            image_count=reply.image_count,
+            elapsed_ms=self._ms(started),
+            **extra,
+        )
+        return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+    def _invoke(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        raw: Any,
+        call_id: str,
+        hook: EventHook | None,
+        round_no: int,
+        pipe: dict[str, Any],
+    ) -> tuple[_ToolReply, str | None, str]:
+        """Run one tool call — server-side or by asking the client — and record it.
+
+        Returns the reply, an error code when it failed, and where it ran
+        (`server` or `client`). Every call that reached a tool is appended to
+        `_called`, a pipe's steps included, so a failed turn can undo them all.
+        `pipe` is empty for the model's own call and names the parent, step and
+        chain for a piped one, which is what a parked client is told.
+        """
+        tool = self.tools.get(name)
+        if tool is None:
+            return _reply(f"Error: unknown tool '{name}'"), "unknown_tool", "server"
+        if tool.is_local:
+            # no hook and no state on this side: the client runs it
+            # recorded before asking, because a client may run a tool and
+            # then fail to answer — a cancelled or timed-out call still
+            # needs its undo offered
+            call = _Call(tool, call_id, arguments, raw, "", False)
+            self._called.append(call)
+            reply, error = self._answer_local(
+                tool, call_id, arguments, raw, hook, round_no, pipe
+            )
+            call.result, call.ok = reply.text, error is None
+            return reply, error, "client"
+        context = ToolContext(
+            tool=tool,
+            agent=self,
+            call_id=call_id,
+            arguments=arguments,
+            raw_arguments=raw,
+            state=self._live_state(tool.namespace),
+            tools=dict(self.tools),
+        )
+        self._emit(
+            hook,
+            "state_loaded",
+            round=round_no,
+            call_id=call_id,
+            tool=name,
+            state_namespace=tool.namespace,
+            keys=sorted(context.state),
+            inherited=len(self._state_bases.get(tool.namespace) or {}),
+        )
+        reply, error = _run_hook(tool, context)
+        if error not in NOT_RUN:
+            self._called.append(
+                _Call(tool, call_id, arguments, raw, reply.text, error is None)
+            )
+        return reply, error, "server"
 
     def _remember(
         self, hook: EventHook | None, message: dict[str, Any], source: str

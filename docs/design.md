@@ -224,7 +224,56 @@ can react just as it would to a tool that raised. `local_tool_unresolved` report
 the reason (`timeout`, `cancelled`), and `cancel` releases a parked turn like any
 other.
 
-## 6. Persistence
+## 6. Tool pipes
+
+A tool can answer with a call instead of text:
+
+```python
+return ToolCall("nix_add_file", {
+    "sandbox_id": sandbox,
+    "path": path,
+    "content_base64": base64.b64encode(data).decode("ascii"),
+})
+```
+
+The harness runs that call next — server-side or, for a tool with no hook, by
+parking the turn and asking the client — and follows whatever it returns until a
+call answers with text. One tool hands off to the next; the model is not
+consulted in between.
+
+The motivation is the transcript. A file's bytes are exactly the kind of thing a
+tool can hold but a model should never have to quote: routing them through a
+tool-call argument would make every later request carry the base64, at token
+cost, for information the model cannot use. A pipe keeps the value where it
+belongs — in the process, and in the block's own record — while still letting the
+model ask for the work in one call and see it done.
+
+Three decisions shape the implementation.
+
+**Only the ends reach the model.** The tool message is the chain of names plus
+the last call's output (`[tool pipe] fetch -> write_file\nwrote 1024 bytes`).
+Anything else the steps said is dropped from the transcript, not summarised, so
+there is no way for an intermediate value to leak back in — including through
+the tool message, which is built from the final reply alone.
+
+**The middle is still recorded.** `HHAgent.pipe_traces` keeps one record per
+pipe: the chain, each step's call id, `via`, arguments, its own result and
+whether it failed. `get_context` serves them, and `pipe_step_started` /
+`pipe_step_finished` report them live, so "what actually ran" is inspectable
+even though "what the model saw" is deliberately small. Values are stored
+bounded — a prefix, the true length and a digest — since a step may legitimately
+carry a megabyte, and the database's budget is sized for conversations, not for
+payloads that live in the sandbox anyway.
+
+**Every step is a call in its own right.** Each one is recorded in the turn's
+call list with its own derived id (`call_1:pipe:1`), so rollback walks them
+newest-first like any other call, `state_loaded` is emitted per step, and a
+client-run step is answered with the same `resolve_tool` command — with `call`
+instead of `result` when the client wants to pipe onward itself. A pipe is
+bounded to `MAX_PIPE_DEPTH` calls, because it runs without the model in the loop
+and a tool that keeps asking for itself would otherwise never end.
+
+## 7. Persistence
 
 `HHStore` mirrors the registry into SQLite. Per block it stores identity and
 linkage, the conversation the block owns, its state deltas, its lifecycle flags
@@ -256,7 +305,7 @@ the event, so killing the server the instant a turn completed dropped it.
 `ON DELETE CASCADE`, so removing a subtree cannot leave an orphan — and a
 config of `PRAGMA foreign_keys = ON` is set per connection.
 
-## 7. Eviction
+## 8. Eviction
 
 The file has a budget (`--max-db-bytes`, default 64 MiB, `0` disables). After
 every write the size is measured and whole subtrees are evicted until it fits.
@@ -288,7 +337,7 @@ Two limits worth knowing: SQLite's own schema occupies ~24 KiB, so a budget belo
 that can never be met (the loop empties the store and stops); and eviction only
 runs after a write, so an over-budget file stays that way until the next one.
 
-## 8. Concurrency
+## 9. Concurrency
 
 Threaded, with a few deliberate serialisation points.
 
@@ -322,7 +371,7 @@ client was told nothing, and the client waits forever. This was a real bug; the
 fix is the shared hold, and the test that catches it injects a delay into `save`
 and evicts in the middle.
 
-## 9. Known limits and open work
+## 10. Known limits and open work
 
 - **Context grows with the chain.** Nothing is trimmed, summarised or capped, so
   the request body grows linearly with depth. Tool state is deliberately exempt:

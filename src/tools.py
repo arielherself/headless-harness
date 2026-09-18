@@ -1,8 +1,8 @@
 import json
 import os
 import platform
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -23,8 +23,30 @@ class ToolParam:
 
 
 @dataclass
+class ToolCall:
+    """A tool call one tool asks the harness to run before it is done.
+
+    A hook returns text when it has finished. Returning one of these instead —
+    on its own, or as `ToolResult(...).call` — puts the call at the end of a
+    *pipe*: the harness runs `name` with `arguments` as if the model had asked
+    for it, and hands the result to whatever that tool returns in turn.
+
+    `arguments` is an ordinary Python dict, so a value too big or too awkward
+    for a model to quote (a file's bytes, a page of HTML) can travel through a
+    pipe without ever entering the transcript. Only the tools a pipe called and
+    the *last* call's output reach the model; what the earlier calls returned,
+    arguments included, is recorded on the block for inspection (see
+    `HHAgent.pipe_traces`) and reported through events, but never sent to the
+    provider.
+    """
+
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ToolResult:
-    """What a hook hands back: text, optionally with images.
+    """What a hook hands back: text, optionally with images or a next call.
 
     A hook may return a plain string, as before, or one of these when the model
     should see images too. `images` takes the same shapes `fork` accepts: an
@@ -33,10 +55,16 @@ class ToolResult:
     will not hand a provider one to open. The text is what events, failure
     summaries and rollback reports carry; the image bytes only ever go into the
     model's tool message.
+
+    `call`, when set, makes this result the first half of a pipe instead: the
+    text is recorded for inspection but not shown, `images` may not be set (the
+    model only ever sees the last call's), and the named tool runs next. A
+    `ToolCall` returned on its own means the same thing with no text at all.
     """
 
     text: str = ""
     images: tuple[Any, ...] = ()
+    call: ToolCall | None = None
 
 
 @dataclass
@@ -123,6 +151,11 @@ class ToolContext:
     state: dict[str, Any]
     # set only for a rollback: the text the call being undone returned
     result: str | None = None
+    # Every tool the block offers, keyed by name: what a hook may pipe to, with
+    # the parameters each expects. A name that is not here cannot be piped to —
+    # the harness answers with an unknown-tool error — so a piping tool can
+    # check first. The mapping is a copy; editing it changes nothing.
+    tools: Mapping[str, ToolEntry] = field(default_factory=dict)
 
 
 def get_system_info_executor(context: ToolContext, **arguments: Any) -> str:

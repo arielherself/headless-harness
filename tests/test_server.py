@@ -1581,6 +1581,142 @@ class LocalToolProtocolTests(ServerTestCase):
         self.assertIn("May still be in effect: send_mail.", note)
 
 
+# --- tool pipes over the protocol ----------------------------------------
+
+
+class ToolPipeProtocolTests(ServerTestCase):
+    """A local tool can answer with a call; the server runs it before the model."""
+
+    def _pipe_turn(self, fixture, client):
+        """Run a turn whose only call is a local one, up to its answer."""
+        self.create(client, "root", local_tools=[{"name": "fetch_file"}])
+        self.fork(client, "root", "fetch", new_id="a1")
+        self.provider.script(
+            Response.tool_calls([("fetch_file", {"url": "https://x.test/f"}, "c1")]),
+            Response.text("thanks"),
+        )
+        mark = client.mark()
+        client.send("run", rid="r1", id="a1")
+        called = client.wait_event("local_tool_called", since=mark)
+        self.assertEqual(called["call_id"], "c1")
+        return mark
+
+    def test_a_local_answer_can_pipe_into_a_server_tool(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        mark = self._pipe_turn(fixture, client)
+
+        # the client fetched the bytes itself and hands them to a builtin, so
+        # neither the bytes nor the note cross the provider connection
+        client.command(
+            "resolve_tool",
+            id="a1",
+            call_id="c1",
+            result="downloaded 32 bytes",
+            call={"name": "set_magic_number", "arguments": {"magic": "piped"}},
+        )
+        answered = client.wait_event("local_tool_answered", since=mark)
+        self.assertTrue(answered["ok"])
+        self.assertEqual(answered["next"], "set_magic_number")
+
+        resolved = client.wait_event("local_tool_resolved", since=mark)
+        self.assertEqual(resolved["next"], "set_magic_number")
+        step = client.wait_event("pipe_step_started", since=mark)
+        self.assertEqual(step["name"], "set_magic_number")
+        self.assertEqual(step["call_id"], "c1:pipe:1")
+        self.assertEqual(step["parent_call_id"], "c1")
+        self.assertEqual(step["step"], 1)
+        self.assertEqual(step["chain"], ["fetch_file", "set_magic_number"])
+        self.assertEqual(step["via"], "server")
+        finished = client.wait_event("pipe_step_finished", since=mark)
+        self.assertTrue(finished["ok"])
+        self.assertEqual(finished["text"], "Magic is set to piped")
+        outer = client.wait_event("tool_call_finished", since=mark)
+        self.assertEqual(outer["chain"], ["fetch_file", "set_magic_number"])
+        self.assertEqual(outer["steps"], 1)
+
+        done = client.wait_event("command_finished", since=mark, rid="r1")
+        self.assertEqual(done["status"], "ok")
+        block = self.fetch_block(fixture, "a1")
+        self.assertEqual(
+            block.messages[2]["content"],
+            "[tool pipe] fetch_file -> set_magic_number\nMagic is set to piped",
+        )
+        # the piped call was a real call: its state committed with the turn
+        self.assertEqual(block.merged_state("magic"), {"magic": "piped"})
+        self.assertEqual(
+            block.pipe_traces[0]["steps"][0]["text"], "downloaded 32 bytes"
+        )
+        self.assertNotIn(
+            "downloaded 32 bytes", json.dumps(self.provider.last_payload()["messages"])
+        )
+
+    def test_resolve_tool_validates_a_piped_call(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        mark = self._pipe_turn(fixture, client)
+        cases = [
+            {"call": 5},
+            {"call": {"name": ""}},
+            {"call": {"name": "set_magic_number", "arguments": []}},
+            {"call": {"name": "set_magic_number"}, "error": "nope"},
+            {
+                "call": {"name": "set_magic_number"},
+                "images": ["data:image/png;base64,AAAA"],
+            },
+        ]
+        for index, fields in enumerate(cases):
+            rid = f"r{index}"
+            client.send("resolve_tool", rid=rid, id="a1", call_id="c1", **fields)
+            client.wait_error(rid, code="bad_call")
+            # a rejected answer leaves the call parked, so it can be retried
+            self.assertEqual(self.fetch_block(fixture, "a1").pending_calls(), ["c1"])
+        client.command("resolve_tool", id="a1", call_id="c1", result="fine")
+        done = client.wait_event("command_finished", since=mark, rid="r1")
+        self.assertEqual(done["status"], "ok")
+        self.assertEqual(self.fetch_block(fixture, "a1").messages[2]["content"], "fine")
+
+    def test_get_context_and_list_agents_report_pipe_traces(self):
+        fixture = self.start_server(with_store=True)
+        client = fixture.client()
+        mark = self._pipe_turn(fixture, client)
+        client.command(
+            "resolve_tool",
+            id="a1",
+            call_id="c1",
+            call={"name": "set_magic_number", "arguments": {"magic": "piped"}},
+        )
+        client.wait_event("command_finished", since=mark, rid="r1")
+
+        client.command("get_context", id="a1")
+        context = client.wait_event("context", since=mark)
+        self.assertEqual(context["messages"][2]["content"].splitlines()[0],
+                         "[tool pipe] fetch_file -> set_magic_number")
+        self.assertEqual(len(context["pipe_traces"]), 1)
+        trace = context["pipe_traces"][0]
+        self.assertEqual(trace["call_id"], "c1")
+        self.assertEqual(trace["chain"], ["fetch_file", "set_magic_number"])
+        self.assertTrue(trace["ok"])
+        self.assertEqual(
+            [step["name"] for step in trace["steps"]],
+            ["fetch_file", "set_magic_number"],
+        )
+        self.assertEqual(trace["steps"][0]["via"], "client")
+        self.assertEqual(trace["steps"][0]["next"], "set_magic_number")
+        self.assertEqual(
+            trace["steps"][1]["arguments"], {"magic": "piped"}
+        )
+
+        client.command("list_agents")
+        listed = client.wait_event("agents_listed", since=mark)
+        entry = [
+            candidate
+            for candidate in listed["agents"]
+            if candidate["agent_id"] == "a1"
+        ][0]
+        self.assertEqual(entry["pipe_traces"], 1)
+
+
 # --- the registry --------------------------------------------------------
 
 
@@ -1802,6 +1938,37 @@ class PersistenceTests(ServerTestCase):
         listed = client.wait_event("agents_listed")
         entry = [a for a in listed["agents"] if a["agent_id"] == "a1"][0]
         self.assertEqual(entry["image_count"], 1)
+
+    def test_pipe_traces_survive_a_restart(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        self.create(client, "root", local_tools=[{"name": "fetch_file"}])
+        self.fork(client, "root", "fetch", new_id="a1")
+        self.provider.script(
+            Response.tool_calls([("fetch_file", {"url": "https://x.test/f"}, "c1")]),
+            Response.text("thanks"),
+        )
+        mark = client.mark()
+        client.send("run", rid="r1", id="a1")
+        client.wait_event("local_tool_called", since=mark)
+        client.command(
+            "resolve_tool",
+            id="a1",
+            call_id="c1",
+            call={"name": "set_magic_number", "arguments": {"magic": "kept"}},
+        )
+        client.wait_event("command_finished", since=mark, rid="r1")
+        self.stop_server(fixture)
+
+        second = self.start_server()
+        client = second.client()
+        client.command("get_context", id="a1")
+        event = client.wait_event("context")
+        self.assertEqual(len(event["pipe_traces"]), 1)
+        trace = event["pipe_traces"][0]
+        self.assertEqual(trace["chain"], ["fetch_file", "set_magic_number"])
+        self.assertEqual(trace["steps"][1]["arguments"], {"magic": "kept"})
+        self.assertEqual(trace["steps"][1]["text"], "Magic is set to kept")
 
     def test_a_restart_keeps_local_tool_definitions(self):
         fixture = self.start_server()

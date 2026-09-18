@@ -23,8 +23,8 @@ Commands
     get_context    {id}                                flattened message list
     get_state      {id, tool?}                         rebuilt tool state
     set_state      {id, tool, key, value?/delete?}     seed or drop a state key
-    resolve_tool   {id, call_id, result?, images?,
-                    error?}                            answer a local tool call
+    resolve_tool   {id, call_id, result?, images?, error?,
+                    call?}                             answer a local tool call
     list_agents    {}                                  every block, with links
     destroy_agent  {id}                                drop a block and its subtree
     ping           {echo?}
@@ -39,7 +39,8 @@ Events
     request_payload, response_received, request_finished, request_failed,
     content_delta, reasoning_delta, sse_chunk (verbose), sse_unparsed, usage,
     assistant_message, history_appended, tool_call_requested,
-    tool_call_started, tool_call_finished, state_loaded, state_delta,
+    tool_call_started, tool_call_finished, pipe_step_started,
+    pipe_step_finished, state_loaded, state_delta,
     state_discarded, local_tool_called, local_tool_rollback,
     local_tool_resolved, local_tool_unresolved, rollback_started,
     rollback_finished, rollback_unavailable, failure_summary_started,
@@ -63,6 +64,21 @@ to the model with everything else, and when one is called the server emits
 `local_tool_called` and parks that turn until a `resolve_tool` command arrives
 with the result. The wait holds no lock and touches no database, so the rest of
 the server keeps working while a client decides.
+
+A tool does not have to answer with text. A server hook that returns a
+`ToolCall` — or a `ToolResult` carrying one — starts a **pipe**: the harness runs
+the named tool next, and keeps following calls until one returns text. A local
+tool can do the same by answering `resolve_tool` with `call` instead of `result`,
+and either kind may hand off to the other. Only the tools a pipe called and the
+last call's output are shown to the model: the tool message becomes
+`[tool pipe] first -> second\n<the last result>`. Each step's arguments and
+result are recorded on the block (`get_context` returns them as `pipe_traces`)
+and reported by the `pipe_step_started` / `pipe_step_finished` events, but never
+sent to the provider — which is the point, since a step may carry a file's bytes
+that the model must not have to quote. A pipe runs without the model in the
+loop, so it is bounded to `MAX_PIPE_DEPTH` calls before it is cut off with a
+`pipe_depth` error; every step that reached a tool is rolled back with the turn
+if the turn does not commit.
 
 With `--db` the registry is mirrored to a SQLite file: a block is written when
 it is forked and again when its turn ends, so a process that dies mid-turn
@@ -101,7 +117,7 @@ from agent import (
 )
 from protocol import PROTOCOL_VERSION
 from store import HHStore, HHStoreError
-from tools import ToolEntry, ToolParam, builtin_tools
+from tools import ToolCall, ToolEntry, ToolParam, builtin_tools
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -202,9 +218,14 @@ COMMANDS: list[dict[str, Any]] = [
         "fields": {
             "id": "required, the block whose turn is waiting",
             "call_id": "required, from the local_tool_called event",
-            "result": "the text handed back to the model; optional when 'images' is given",
+            "result": "the text handed back to the model; optional when 'images' or 'call' is given",
             "images": "optional list of http(s) URLs or data:image/... URIs the tool returned",
             "error": "optional; marks the call failed and is reported as such",
+            "call": (
+                "optional {name, arguments} for the tool to run next, continuing "
+                "the pipe instead of ending it; cannot be combined with 'error' "
+                "or 'images'"
+            ),
         },
     },
     {"command": "ping", "summary": "Liveness probe.", "fields": {"echo": "optional"}},
@@ -632,6 +653,9 @@ class HHServer(socketserver.ThreadingTCPServer):
             context_len=len(context),
             local_len=len(block.messages),
             messages=block.messages,
+            # what the block's own tool pipes did, step by step, with their
+            # intermediate values bounded: for inspection, never for the model
+            pipe_traces=block.pipe_traces,
         )
 
     def cmd_list_agents(
@@ -783,16 +807,29 @@ class HHServer(socketserver.ThreadingTCPServer):
         if error is not None and (not isinstance(error, str) or not error):
             raise HHTcpError("bad_field", "'error' must be a non-empty string")
         images = parse_images(command.get("images"))
-        if "result" not in command and error is None and not images:
+        call = None
+        if command.get("call") is not None:
+            call = parse_tool_call(command["call"])
+            if error is not None:
+                raise HHTcpError(
+                    "bad_call", "'error' and 'call' cannot both be given"
+                )
+            if images:
+                raise HHTcpError(
+                    "bad_call",
+                    "'images' cannot ride a pipe: only the last call of a pipe "
+                    "may return images",
+                )
+        if "result" not in command and error is None and not images and call is None:
             raise HHTcpError(
-                "bad_field", "resolve_tool needs 'result', 'images' or 'error'"
+                "bad_field", "resolve_tool needs 'result', 'images', 'error' or 'call'"
             )
         result = command.get("result")
         if result is None:
             result = ""
         elif not isinstance(result, str):
             result = json.dumps(result, ensure_ascii=False, default=str)
-        if not block.resolve_local_call(call_id, result, error, images):
+        if not block.resolve_local_call(call_id, result, error, images, call):
             raise HHTcpError(
                 "unknown_call",
                 f"agent {agent_id!r} is not waiting on {call_id!r}",
@@ -806,6 +843,8 @@ class HHServer(socketserver.ThreadingTCPServer):
             ok=error is None,
             result_chars=len(result),
             image_count=len(images),
+            # the tool that runs next, when the answer kept a pipe going
+            next=call.name if call is not None else None,
         )
 
     def cmd_ping(self, conn: Connection, command: dict[str, Any], rid: Any) -> None:
@@ -966,6 +1005,7 @@ class HHServer(socketserver.ThreadingTCPServer):
                 t.name for t in block.tools.values() if t.has_rollback
             ),
             "waiting_on": block.pending_calls(),
+            "pipe_traces": len(block.pipe_traces),
             "include_usage": block.include_usage,
             "verbose": block.verbose,
             "max_tokens": block.max_tokens,
@@ -987,6 +1027,21 @@ def parse_images(value: Any) -> list[dict[str, Any]]:
         return image_content_parts(value)
     except HHAgentError as exc:
         raise HHTcpError("bad_image", str(exc)) from exc
+
+
+def parse_tool_call(value: Any) -> ToolCall:
+    """Check a wire `call` field and render it as a `ToolCall`."""
+    if not isinstance(value, dict):
+        raise HHTcpError(
+            "bad_call", "'call' must be an object with 'name' and 'arguments'"
+        )
+    name = value.get("name")
+    if not isinstance(name, str) or not name:
+        raise HHTcpError("bad_call", "'call' needs a non-empty 'name'")
+    arguments = value.get("arguments", {})
+    if not isinstance(arguments, dict):
+        raise HHTcpError("bad_call", "'call' arguments must be an object")
+    return ToolCall(name=name, arguments=arguments)
 
 
 def apply_overrides(block: HHAgent, command: dict[str, Any]) -> None:

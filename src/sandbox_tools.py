@@ -3,8 +3,8 @@
 The sandbox itself is the `sandbox` package at the project root; this module is
 the harness side of it. It keeps the shape the tools promise:
 
-* one fixed container — 256M memory, 512M disk, 256 pids, one CPU, the host
-  network, and a writable `/workspace` as the working directory. None of that
+* one fixed container — 256M memory, 512M disk, 256 pids, one CPU, no network,
+  and a writable `/workspace` as the working directory. None of that
   is a tool parameter: the model chooses *what* runs in a sandbox, never how
   much of the machine it gets.
 * ids live in this process's memory only, so nothing about a sandbox is written
@@ -45,7 +45,10 @@ SANDBOX_MEMORY_BYTES = 256 * 1024**2
 SANDBOX_DISK_BYTES = 512 * 1024**2
 SANDBOX_PIDS = 256
 SANDBOX_CPU = 1.0
-SANDBOX_NETWORK = True  # the host's network namespace: a sandbox that can fetch
+# `False` gives the sandbox its own network namespace, where only `lo` exists:
+# nothing to route to and no resolver to look a name up with. `nix_add_dependency`
+# still works — Nix builds run in the harness process, outside the sandbox.
+SANDBOX_NETWORK = False
 
 # How many sandboxes may exist at once, how long one may go untouched before a
 # sweep may destroy it, and how often the sweeper runs. The idle timeout is

@@ -128,7 +128,7 @@ class FixedConfigurationTests(unittest.TestCase):
         self.assertEqual(spec.resources.pids, 256)
         self.assertEqual(spec.resources.cpu, 1.0)
         self.assertEqual(spec.resources.timeout, 600.0)
-        self.assertEqual(spec.network.mode, "host")
+        self.assertEqual(spec.network.mode, "none")
 
     def test_the_workspace_is_the_writable_working_directory(self):
         spec = sandbox_tools.sandbox_spec()
@@ -146,7 +146,7 @@ class SpawnTests(RegistryTestCase):
         self.assertIn("/workspace", text)
         self.assertIn("256M", text)
         self.assertIn("512M", text)
-        self.assertIn("network host", text)
+        self.assertIn("network none", text)
         self.assertIn("bash, coreutils", text)
         self.assertIn("nix_add_dependency", text)
         self.assertEqual(registry.live_ids(), ("sbx-0001",))
@@ -192,7 +192,7 @@ class StatusTests(RegistryTestCase):
         self.assertIn("created less than a second ago", text)
         self.assertIn("packages: bash, coreutils", text)
         self.assertIn(
-            "limits: memory 256M, disk 512M, pids 256, cpu 1.0, network host", text
+            "limits: memory 256M, disk 512M, pids 256, cpu 1.0, network none", text
         )
         self.assertIn("/workspace", text)
 

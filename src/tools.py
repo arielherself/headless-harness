@@ -416,13 +416,16 @@ nix_spawn_sandbox_tool = ToolEntry(
     description=(
         "Create an isolated Nix sandbox and return its id; every other nix_* "
         "tool takes that id. The sandbox has a fixed shape that cannot be "
-        "changed: 256M memory, 512M disk, 256 processes, one CPU, network "
+        "changed: 256M memory, 512M disk, 256 processes, one CPU, no network "
         "access, and a writable /workspace that is also the working directory. "
-        "It starts with only bash and coreutils, so install what you need with "
-        "nix_add_dependency. Use it — rather than the machine the harness runs "
-        "on — for untrusted code, package installs and anything else that "
-        "should be contained, and destroy it with nix_destroy_sandbox when the "
-        "work is done."
+        "It cannot reach the network — there is no DNS either — so anything "
+        "that fetches at runtime (curl, pip install, git clone) fails. "
+        "nix_add_dependency is unaffected, because Nix builds run in the "
+        "harness process, outside the sandbox. It starts with only bash and "
+        "coreutils. Use it — rather than the machine the harness runs on — "
+        "for untrusted code, package installs and anything else that should "
+        "be contained, and destroy it with nix_destroy_sandbox when the work "
+        "is done."
     ),
     params=[],
     hook=nix_spawn_sandbox_executor,

@@ -394,11 +394,13 @@ implementation lives in `src/sandbox_tools.py`, and they behave differently from
 the tools above in four ways worth knowing.
 
 **There is one fixed configuration, and spawn takes no parameters.** Every
-sandbox gets 256M of memory, 512M of disk, 256 pids, one CPU, the host network,
-and a writable `/workspace` that is also the working directory. The model chooses
-what runs in a sandbox, never how much of the machine it gets. A new sandbox
-starts with bash and coreutils; `nix_add_dependency` installs more Nix packages,
-one per call, into the environment the next `nix_exec` sees.
+sandbox gets 256M of memory, 512M of disk, 256 pids, one CPU, no network, and a
+writable `/workspace` that is also the working directory. The model chooses what
+runs in a sandbox, never how much of the machine it gets. A new sandbox starts
+with bash and coreutils; `nix_add_dependency` installs more Nix packages, one per
+call, into the environment the next `nix_exec` sees — the build runs in the
+harness, so a package install still works even though the sandbox itself cannot
+reach the network.
 
 **Ids are memory, not state.** `nix_spawn_sandbox` returns an id like
 `sbx-3f2a9c1b7d0e`, and every other `nix_*` tool takes it. The registry is

@@ -10,7 +10,9 @@ points at one `bin/` directory inside it.
 because a sandbox whose `/bin/sh` does not resolve is not a sandbox anyone can
 do anything in. The store path for a given package list never changes, so
 resolution is cached in-process and, best effort, in a JSON file under the
-user's cache directory.
+user's cache directory; `resolve_packages` is the entry point a created sandbox
+uses to ask for a different list, which is how packages are added or removed
+after `Sandbox.create`.
 
 Nothing here runs sandboxed: `nix-build` is invoked the way the operator's Nix
 is configured, which is also how the closure lands in the store.
@@ -26,6 +28,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from .spec import Mount, SandboxSpec
 
@@ -201,15 +204,35 @@ def resolve(spec: SandboxSpec, *, runner=None, use_cache: bool = True) -> Toolch
             origin="given",
             warnings=_inspect(spec.env_dir),
         )
-    packages = with_base_packages(spec.packages)
-    key = f"{spec.nixpkgs or '<nixpkgs>'}|{' '.join(packages)}"
+    return resolve_packages(
+        spec.packages, nixpkgs=spec.nixpkgs, runner=runner, use_cache=use_cache
+    )
+
+
+def resolve_packages(
+    packages: Sequence[str],
+    *,
+    nixpkgs: str | None = None,
+    runner=None,
+    use_cache: bool = True,
+) -> Toolchain:
+    """A Nix environment holding `packages`, plus `bash` and `coreutils`.
+
+    A package list maps to one `buildEnv` store path and never to another, so
+    resolution is cached in-process and, best effort, on disk. This is what
+    `resolve` ends up calling for a spec, and it is also what lets a sandbox
+    change its packages after creation: a new list is just another store path,
+    and every command already mounts `/nix/store` read-only.
+    """
+    packages = with_base_packages(tuple(packages))
+    key = f"{nixpkgs or '<nixpkgs>'}|{' '.join(packages)}"
     if use_cache:
         cached = _load_cache().get(key)
         if cached and os.path.isdir(cached):
             return Toolchain(
                 path=cached, packages=packages, origin="nix", warnings=_inspect(cached)
             )
-    store_path = build(packages, nixpkgs=spec.nixpkgs, runner=runner)
+    store_path = build(packages, nixpkgs=nixpkgs, runner=runner)
     if use_cache:
         _env_cache[key] = store_path
         _save_cache()

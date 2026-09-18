@@ -159,6 +159,36 @@ child of the sandboxed process. That is exactly what typing into the shell does,
 and why `interact()` moves bytes between two terminals rather than handing over
 a file descriptor.
 
+## Packages: changing the environment after creation
+
+`Sandbox.add_packages(*names)` and `Sandbox.remove_packages(*names)` change the
+Nix environment of a sandbox that already exists; `sandbox.packages` says what
+the next command will have:
+
+```python
+sandbox = Sandbox.create(packages=["python312"], writable=["/work"])
+sandbox.add_packages("ripgrep")          # ('python312', 'ripgrep', 'bash', 'coreutils')
+sandbox.exec(["rg", "TODO", "/work"])
+sandbox.remove_packages("ripgrep")       # ('python312', 'bash', 'coreutils')
+```
+
+Each call asks Nix for one `buildEnv` store path holding the new list. A store
+path is immutable, so the environment is never edited in place: the sandbox
+swaps one store path for another. A list that was built before is answered from
+the cache (in-process and on disk, keyed by `nixpkgs` and the list) rather than
+built again, which is what makes going back and forth between two package sets
+cheap. If the build fails — a name that does not exist, or a closure that is not
+local and no network to fetch it — the sandbox keeps the environment it had.
+
+The change lands on the next command, because that is when the current store
+path is mounted. A session already open keeps the environment it started with
+(its `PATH` was fixed when bubblewrap started), and `warnings` says so. `bash`
+and `coreutils` are always in the environment — `/bin/sh` and `#!/usr/bin/env`
+have to resolve — so `remove_packages` refuses them, and it refuses a name the
+sandbox was never asked for rather than reporting a removal that did nothing. A
+sandbox whose environment is a directory (`env_dir=`, `--host-tools`) has no Nix
+packages to change, and says that too.
+
 ## Resource limits: which engine
 
 `Sandbox.create(limits_engine=...)` or `HH_SANDBOX_CGROUP` picks where the
@@ -280,7 +310,7 @@ path and a cgroup; running a command is one `bwrap` process.
 ## Testing
 
 ```bash
-python -m unittest tests.test_sandbox -v      # 89 tests
+python -m unittest tests.test_sandbox -v      # 99 tests
 python -m sandbox --self-test                 # what this machine really enforces
 ```
 

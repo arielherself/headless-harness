@@ -16,6 +16,11 @@ with a hard size cap.
 
 Nothing here is asynchronous, on purpose: the harness runs tool hooks
 synchronously on threads of their own, and blocking is what they want.
+
+The toolchain is not fixed for the sandbox's lifetime. `add_packages` and
+`remove_packages` ask Nix for another `buildEnv` store path and swap it in; the
+next command mounts it, and a store path already built for a package list is
+reused, so going back to a list costs nothing.
 """
 
 from __future__ import annotations
@@ -65,6 +70,13 @@ FILE_MAX_OUTPUT = 64 * 1024 * 1024
 SETUP_TIMEOUT = 30.0
 # Where sandbox state is created unless the operator says otherwise.
 DEFAULT_STATE_ROOT = "/tmp/headless-harness-sandboxes"
+
+# A package change cannot reach into a command that is already running: its
+# environment was fixed when bubblewrap started.
+_SESSION_ENV_WARNING = (
+    "a session is open, and it keeps the environment it started with; "
+    "the change applies to the next command"
+)
 
 _UNSET = object()
 
@@ -204,10 +216,11 @@ class _StreamReader(threading.Thread):
 class Sandbox:
     """A created sandbox. Use `Sandbox.create`.
 
-    One command runs at a time: a lock serializes `exec` and `put_file` so a
-    threaded harness cannot have two bubblewrap processes racing over the same
-    writable mounts. Nothing is started at creation time, so a sandbox that is
-    created and never used costs a directory.
+    One command runs at a time: a lock serializes `exec`, `put_file` and the
+    package operations so a threaded harness cannot have two bubblewrap
+    processes racing over the same writable mounts, or a command starting while
+    its environment is being replaced. Nothing is started at creation time, so a
+    sandbox that is created and never used costs a directory.
     """
 
     def __init__(
@@ -229,6 +242,7 @@ class Sandbox:
         self.limiter = limiter
         self.program = program
         self.identity = identity
+        self._toolchain_warnings = list(toolchain.warnings)
         self.warnings: list[str] = list(toolchain.warnings)
         self.disk_used: int = 0
         self._file_binds = file_binds
@@ -359,6 +373,117 @@ class Sandbox:
         if spec.packages and spec.env_dir:
             raise SpecError("pass either packages= or env_dir=, not both")
 
+    # -- changing the environment -------------------------------------------
+
+    @property
+    def packages(self) -> tuple[str, ...]:
+        """The packages the next command will have, base packages included."""
+        return self.toolchain.packages
+
+    def add_packages(self, *packages: str) -> tuple[str, ...]:
+        """Add Nix packages to a sandbox that already exists.
+
+        Each call asks Nix for one `buildEnv` store path holding the new list.
+        The change takes effect on the next command, because every command
+        mounts the current store path, and the resulting package list is
+        returned. A package that is already in the environment is ignored, and
+        a package Nix cannot build leaves the sandbox exactly as it was.
+        """
+        names = _package_names(packages)
+        if not names:
+            return self.packages
+        with self._lock:
+            self._check_open()
+            self._require_nix_environment()
+            missing = [name for name in names if name not in self.toolchain.packages]
+            if not missing:
+                return self.packages
+            self._rebuild_toolchain(
+                tuple(dict.fromkeys((*self.spec.packages, *missing)))
+            )
+            return self.packages
+
+    def remove_packages(self, *packages: str) -> tuple[str, ...]:
+        """Remove Nix packages named at creation or added since.
+
+        `bash` and `coreutils` cannot be removed — a Nix environment always has
+        them, because `/bin/sh` and `#!/usr/bin/env` have to resolve — and a
+        name the sandbox was never asked for is refused rather than silently
+        ignored, so a typo does not look like a removal. As with `add_packages`,
+        the new environment is built first and takes effect on the next command.
+        """
+        names = _package_names(packages)
+        if not names:
+            return self.packages
+        with self._lock:
+            self._check_open()
+            self._require_nix_environment()
+            requested = tuple(self.spec.packages)
+            # a list made only of store paths is taken literally: `with_base_packages`
+            # adds nothing to it, so what it names is all there is
+            literal_only = bool(requested) and all(name.startswith("/") for name in requested)
+            if not literal_only:
+                base = [name for name in names if name in toolchain_module.BASE_PACKAGES]
+                if base:
+                    raise SandboxError(
+                        ", ".join(base)
+                        + " cannot be removed: bash and coreutils are always in a Nix "
+                        "environment, because `/bin/sh` and `#!/usr/bin/env` have to "
+                        "resolve"
+                    )
+            absent = [name for name in names if name not in requested]
+            if absent:
+                raise SandboxError(
+                    "not in this sandbox's package list: "
+                    + ", ".join(absent)
+                    + (
+                        f" (it has {', '.join(requested)})"
+                        if requested
+                        else " (it has only the default bash and coreutils)"
+                    )
+                )
+            self._rebuild_toolchain(
+                tuple(name for name in requested if name not in names)
+            )
+            return self.packages
+
+    def _require_nix_environment(self) -> None:
+        """Refuse package changes where there is no Nix environment to change."""
+        if self.spec.env_dir or self.toolchain.origin != "nix":
+            raise SandboxError(
+                "this sandbox's environment is not built by Nix "
+                f"({self.toolchain.describe()}), so its packages cannot change; "
+                "create the sandbox with packages= instead of env_dir="
+            )
+
+    def _rebuild_toolchain(self, packages: tuple[str, ...]) -> None:
+        """Build the environment for a new package list, then adopt it.
+
+        The build runs before anything is changed, so a package that does not
+        exist leaves the old environment in place. A session that is already
+        open keeps the environment it started with — its `PATH` was fixed when
+        bubblewrap started — which is said out loud in `warnings` because the
+        change is otherwise invisible from inside it.
+        """
+        self._require_nix_environment()
+        rebuilt = toolchain_module.resolve_packages(
+            packages, nixpkgs=self.spec.nixpkgs
+        )
+        previous_warnings, self._toolchain_warnings = (
+            self._toolchain_warnings,
+            list(rebuilt.warnings),
+        )
+        self.toolchain = rebuilt
+        self.spec = replace(self.spec, packages=packages)
+        for warning in previous_warnings:
+            if warning in self.warnings:
+                self.warnings.remove(warning)
+        for warning in self._toolchain_warnings:
+            if warning not in self.warnings:
+                self.warnings.append(warning)
+        if self._live_session() is not None and _SESSION_ENV_WARNING not in self.warnings:
+            self.warnings.append(_SESSION_ENV_WARNING)
+
     # -- running things -----------------------------------------------------
 
     def exec(
@@ -384,15 +509,18 @@ class Sandbox:
         if not command:
             raise SandboxError("no command to run")
         budget = self.spec.resources.timeout if timeout is _UNSET else timeout  # type: ignore[assignment]
-        environment = bubblewrap.default_environment(
-            self.spec, self.toolchain, _home_dir(self.mounts), extra=env or {}
-        )
         workdir = cwd or self.spec.cwd
 
         with self._lock:
             # both of these are re-checked under the lock: a destroy() may have
             # won the race while this call was on its way in
             self._check_open()
+            # the environment is built under the lock too, so a package added or
+            # removed on another thread is either in this command's `PATH` or
+            # not in it at all, never half of each
+            environment = bubblewrap.default_environment(
+                self.spec, self.toolchain, _home_dir(self.mounts), extra=env or {}
+            )
             running = self._live_session()
             if running is not None:
                 raise SandboxError(
@@ -871,6 +999,7 @@ class Sandbox:
             "id": self.identity,
             "state_root": str(self.layout.root),
             "toolchain": self.toolchain.describe(),
+            "packages": list(self.toolchain.packages),
             "mounts": [
                 {
                     "path": mount.path,
@@ -1037,6 +1166,14 @@ def _check_cwd(spec: SandboxSpec, mounts: Sequence[ResolvedMount]) -> None:
 def _mode_for(payload: bytes) -> int:
     """Scripts are made executable; everything else is a plain file."""
     return 0o755 if payload.startswith(b"#!") else 0o644
+
+
+def _package_names(packages: Sequence[str]) -> tuple[str, ...]:
+    """Package arguments as a deduplicated tuple, order preserved."""
+    names = tuple(str(name) for name in packages)
+    if any(not name for name in names):
+        raise SandboxError("a package name cannot be empty")
+    return tuple(dict.fromkeys(names))
 
 
 def _seccomp_fd(program: seccomp_module.Program | None) -> int | None:

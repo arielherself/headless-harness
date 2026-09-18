@@ -577,6 +577,33 @@ class ToolchainTests(unittest.TestCase):
         self.assertEqual(first.path, second.path)
         self.assertEqual(len(calls), 1)
 
+    def test_resolve_packages_caches_each_package_list_separately(self):
+        # the entry point a live sandbox uses to change its environment: one
+        # buildEnv per list, base packages included, and a list that was built
+        # before is answered from the cache rather than built again
+        calls = []
+
+        with tempfile.TemporaryDirectory() as fake_store:
+            env_path = Path(fake_store) / "fake-env"
+            (env_path / "bin").mkdir(parents=True)
+            (env_path / "bin" / "sh").symlink_to("/bin/sh")
+
+            def runner(argv, timeout):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, str(env_path).encode() + b"\n", b"")
+
+            with mock.patch.object(
+                toolchain_module, "_load_cache", side_effect=lambda: toolchain_module._env_cache
+            ), mock.patch.object(toolchain_module, "_save_cache"):
+                toolchain_module._env_cache.clear()
+                first = toolchain_module.resolve_packages(("hello",), runner=runner)
+                again = toolchain_module.resolve_packages(("hello",), runner=runner)
+                more = toolchain_module.resolve_packages(("hello", "cowsay"), runner=runner)
+        self.assertEqual(first.path, again.path)
+        self.assertEqual(first.packages, ("hello", "bash", "coreutils"))
+        self.assertEqual(more.packages, ("hello", "cowsay", "bash", "coreutils"))
+        self.assertEqual(len(calls), 2)
+
 
 def _bwrap_available() -> bool:
     """Whether a real sandbox can be started here.
@@ -949,6 +976,142 @@ class SandboxContractTests(unittest.TestCase):
         sandbox = self.create_without_bwrap()
         sandbox.destroy()
         sandbox.destroy()
+
+    # -- changing the environment -------------------------------------------
+
+    def test_packages_can_be_added_and_removed_after_creation(self):
+        sandbox, builds = self.create_with_nix_packages(("python312",))
+        self.assertEqual(sandbox.packages, ("python312", "bash", "coreutils"))
+        self.assertEqual(builds, [("python312",)])
+
+        self.assertEqual(
+            sandbox.add_packages("git"), ("python312", "git", "bash", "coreutils")
+        )
+        self.assertEqual(builds, [("python312",), ("python312", "git")])
+        self.assertEqual(sandbox.spec.packages, ("python312", "git"))
+
+        self.assertEqual(sandbox.remove_packages("python312"), ("git", "bash", "coreutils"))
+        self.assertEqual(builds[-1], ("git",))
+        self.assertEqual(sandbox.spec.packages, ("git",))
+
+    def test_adding_something_already_present_does_not_build_again(self):
+        sandbox, builds = self.create_with_nix_packages(("python312",))
+        self.assertEqual(sandbox.add_packages("bash"), ("python312", "bash", "coreutils"))
+        self.assertEqual(sandbox.add_packages("python312"), ("python312", "bash", "coreutils"))
+        self.assertEqual(sandbox.add_packages("git", "git"), ("python312", "git", "bash", "coreutils"))
+        self.assertEqual(builds, [("python312",), ("python312", "git")])
+        self.assertEqual(sandbox.add_packages(), sandbox.packages)
+
+    def test_a_failed_build_leaves_the_previous_environment_in_place(self):
+        sandbox, _ = self.create_with_nix_packages(("python312",))
+        before = sandbox.packages
+        with mock.patch.object(
+            toolchain_module,
+            "resolve_packages",
+            side_effect=toolchain_module.ToolchainError("undefined variable 'nope'"),
+        ):
+            with self.assertRaises(toolchain_module.ToolchainError):
+                sandbox.add_packages("nope")
+        self.assertEqual(sandbox.packages, before)
+        self.assertEqual(sandbox.spec.packages, ("python312",))
+
+    def test_removing_a_package_the_sandbox_was_never_asked_for_is_refused(self):
+        sandbox, _ = self.create_with_nix_packages(("python312",))
+        with self.assertRaises(SandboxError) as caught:
+            sandbox.remove_packages("git")
+        self.assertIn("git", str(caught.exception))
+        self.assertIn("python312", str(caught.exception))
+        self.assertEqual(sandbox.packages, ("python312", "bash", "coreutils"))
+        with self.assertRaises(SandboxError):
+            sandbox.add_packages("")
+
+    def test_bash_and_coreutils_cannot_be_removed(self):
+        sandbox, _ = self.create_with_nix_packages(("python312",))
+        for name in ("bash", "coreutils"):
+            with self.subTest(name=name):
+                with self.assertRaises(SandboxError):
+                    sandbox.remove_packages(name)
+        self.assertEqual(sandbox.packages, ("python312", "bash", "coreutils"))
+
+    def test_packages_cannot_change_in_a_sandbox_without_nix(self):
+        sandbox = self.create_without_bwrap()
+        for attempt in (
+            lambda: sandbox.add_packages("git"),
+            lambda: sandbox.remove_packages("git"),
+        ):
+            with self.assertRaises(SandboxError) as caught:
+                attempt()
+            self.assertIn("not built by Nix", str(caught.exception))
+
+    def test_packages_cannot_change_after_destroy(self):
+        sandbox, _ = self.create_with_nix_packages(("python312",))
+        sandbox.destroy()
+        with self.assertRaises(SandboxError):
+            sandbox.add_packages("git")
+        with self.assertRaises(SandboxError):
+            sandbox.remove_packages("python312")
+
+    def test_a_live_session_keeps_the_environment_it_started_with(self):
+        # a change cannot reach into a running session: bubblewrap fixed its
+        # PATH when it started, so the sandbox says so instead of pretending
+        sandbox, _ = self.create_with_nix_packages(("python312",))
+        session = mock.MagicMock()
+        session.poll.return_value = None
+        sandbox._session = session
+        sandbox.add_packages("git")
+        self.assertTrue(any("session is open" in warning for warning in sandbox.warnings))
+        session.close.assert_not_called()
+        before = list(sandbox.warnings)
+        sandbox.add_packages("cowsay")
+        self.assertEqual(len(sandbox.warnings), len(before))
+
+    def test_toolchain_warnings_follow_the_environment_that_replaced_them(self):
+        sandbox, _ = self.create_with_nix_packages(("python312",))
+        without_a_shell = [
+            warning for warning in sandbox.warnings if "bin/sh" in warning
+        ]
+        # the fake environments all have a bin/sh, so the only warnings that can
+        # be in this list are ones a replaced toolchain brought
+        self.assertEqual(without_a_shell, [])
+        sandbox._toolchain_warnings = ["a warning from the old environment"]
+        sandbox.warnings.append("a warning from the old environment")
+        sandbox.add_packages("git")
+        self.assertNotIn("a warning from the old environment", sandbox.warnings)
+
+    def create_with_nix_packages(self, packages=("python312",)):
+        """A sandbox whose Nix environments are stand-ins built in a temp dir.
+
+        Rebuilding through real Nix is what the package operations do, but it is
+        not what these tests are about: the fake resolver records every list it
+        was asked for, so the bookkeeping around a rebuild can be checked
+        without a store. Returns `(sandbox, builds)`.
+        """
+        builds = []
+        fake_store = tempfile.mkdtemp(prefix="hh-fake-store-")
+        self.addCleanup(shutil.rmtree, fake_store, True)
+
+        def resolve(package_list, *, nixpkgs=None, runner=None, use_cache=True):
+            effective = toolchain_module.with_base_packages(tuple(package_list))
+            builds.append(tuple(package_list))
+            path = Path(fake_store) / "|".join(effective or ("empty",))
+            (path / "bin").mkdir(parents=True, exist_ok=True)
+            (path / "bin" / "sh").symlink_to("/bin/sh")
+            return toolchain_module.Toolchain(
+                path=str(path), packages=effective, origin="nix"
+            )
+
+        patcher = mock.patch.object(
+            toolchain_module, "resolve_packages", side_effect=resolve
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        state = tempfile.mkdtemp(prefix="hh-packages-")
+        self.addCleanup(shutil.rmtree, state, True)
+        sandbox = Sandbox.create(
+            packages=list(packages), writable=["/work"], state_root=state
+        )
+        self.addCleanup(sandbox.destroy)
+        return sandbox, builds
 
     def create_without_bwrap(self) -> Sandbox:
         spec = SandboxSpec(writable=[], resources=ResourceLimits())

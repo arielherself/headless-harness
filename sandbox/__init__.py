@@ -31,6 +31,9 @@ tmpfs with things bind-mounted into it.
     result = sandbox.exec(["python", "/work/main.py"])
     sandbox.destroy()
 
+The environment is not fixed for the sandbox's lifetime: `add_packages` and
+`remove_packages` swap in another Nix store path, and the next command sees it.
+
 What each part of a spec buys, and what it does not:
 
 | You asked for              | Enforced by                          | Hard? |

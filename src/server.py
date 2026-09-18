@@ -13,9 +13,11 @@ earlier block again; the blocks beyond it stay untouched.
 
 Commands
     create_agent   {id?, endpoint?, key?, model?, tools?, timeout?,
-                    include_usage?, verbose?}          makes a root block
+                    max_tokens?, include_usage?,
+                    verbose?}                          makes a root block
     fork           {id, prompt, images?, new_id?, model?, tools?, timeout?,
-                    include_usage?, verbose?}          appends a block
+                    max_tokens?, include_usage?,
+                    verbose?}                          appends a block
     run            {id}                                executes a block's turn
     cancel         {id}                                stop a running turn
     get_context    {id}                                flattened message list
@@ -88,6 +90,7 @@ from typing import Any, cast
 
 from agent import (
     DEFAULT_LOCAL_TIMEOUT,
+    DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_TIMEOUT,
     HHAgent,
@@ -121,6 +124,7 @@ COMMANDS: list[dict[str, Any]] = [
             "no undo is available",
             "timeout": "optional read timeout in seconds",
             "local_timeout": "optional seconds to wait for a local tool answer",
+            "max_tokens": "optional output-token cap; 0 leaves it to the provider",
             "summary_model": "optional model for failure summaries; defaults to the block's own",
             "include_usage": "optional bool, ask for token accounting",
             "verbose": "optional bool, also emit raw sse_chunk events",
@@ -142,6 +146,7 @@ COMMANDS: list[dict[str, Any]] = [
             "local_tools": "optional override, replaces the inherited definitions",
             "timeout": "optional override inherited from the parent",
             "local_timeout": "optional override inherited from the parent",
+            "max_tokens": "optional override inherited from the parent",
             "summary_model": "optional override inherited from the parent",
             "include_usage": "optional override inherited from the parent",
             "verbose": "optional override inherited from the parent",
@@ -207,10 +212,12 @@ COMMANDS: list[dict[str, Any]] = [
 
 # Settings a fork may override on the block it creates.
 INHERITED = (
-    "model", "timeout", "local_timeout", "summary_model", "include_usage", "verbose"
+    "model", "timeout", "local_timeout", "max_tokens", "summary_model",
+    "include_usage", "verbose",
 )
 BOOL_FIELDS = ("include_usage", "verbose")
 FLOAT_FIELDS = ("timeout", "local_timeout")
+INT_FIELDS = ("max_tokens",)
 
 
 class HHTcpError(Exception):
@@ -476,6 +483,12 @@ class HHServer(socketserver.ThreadingTCPServer):
             local_timeout=as_timeout(
                 command.get("local_timeout") or DEFAULT_LOCAL_TIMEOUT, "local_timeout"
             ),
+            max_tokens=as_max_tokens(
+                DEFAULT_MAX_TOKENS
+                if command.get("max_tokens") is None
+                else command["max_tokens"],
+                "max_tokens",
+            ),
             summary_model=command.get("summary_model") or "",
             include_usage=bool(command.get("include_usage", True)),
             verbose=bool(command.get("verbose", False)),
@@ -502,6 +515,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             summary_model=block.summary_model,
             include_usage=block.include_usage,
             verbose=block.verbose,
+            max_tokens=block.max_tokens,
             tools=sorted(block.tools),
             local_tools=sorted(t.name for t in block.tools.values() if t.is_local),
             tool_schemas=block.tool_schemas(),
@@ -551,6 +565,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             timeout=child.timeout,
             include_usage=child.include_usage,
             verbose=child.verbose,
+            max_tokens=child.max_tokens,
             tools=sorted(child.tools),
             local_tools=sorted(t.name for t in child.tools.values() if t.is_local),
             state_namespaces=child.state_namespaces(),
@@ -953,6 +968,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             "waiting_on": block.pending_calls(),
             "include_usage": block.include_usage,
             "verbose": block.verbose,
+            "max_tokens": block.max_tokens,
             "created_at": block.created_at,
             "age_ms": round((time.time() - block.created_at) * 1000, 3),
         }
@@ -985,6 +1001,8 @@ def apply_overrides(block: HHAgent, command: dict[str, Any]) -> None:
             setattr(block, name, value)
         elif name in FLOAT_FIELDS:
             setattr(block, name, as_timeout(value, name))
+        elif name in INT_FIELDS:
+            setattr(block, name, as_max_tokens(value, name))
         else:
             if not isinstance(value, str) or not value:
                 raise HHTcpError(
@@ -1030,6 +1048,19 @@ def as_timeout(value: Any, field: str) -> float:
     if timeout <= 0:
         raise HHTcpError("bad_field", f"{field!r} must be positive")
     return timeout
+
+
+def as_max_tokens(value: Any, field: str) -> int:
+    """Coerce an output-token cap; `0` means no cap and is allowed."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise HHTcpError("bad_field", f"{field!r} must be an integer")
+    try:
+        cap = int(value)
+    except ValueError as exc:
+        raise HHTcpError("bad_field", f"{field!r} must be an integer: {exc}") from exc
+    if cap < 0:
+        raise HHTcpError("bad_field", f"{field!r} must not be negative")
+    return cap
 
 
 def build_tools(

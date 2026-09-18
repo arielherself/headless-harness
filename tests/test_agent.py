@@ -321,6 +321,7 @@ class RootAndForkTests(HHTestCase):
         self.assertEqual(root.model, agent.DEFAULT_MODEL)
         self.assertEqual(root.timeout, agent.DEFAULT_TIMEOUT)
         self.assertEqual(root.local_timeout, agent.DEFAULT_LOCAL_TIMEOUT)
+        self.assertEqual(root.max_tokens, agent.DEFAULT_MAX_TOKENS)
         self.assertEqual(root.summary_model, "")
         self.assertTrue(root.include_usage)
         self.assertFalse(root.verbose)
@@ -459,6 +460,7 @@ class RootAndForkTests(HHTestCase):
             model="parent-model",
             timeout=7.0,
             local_timeout=3.0,
+            max_tokens=8,
             summary_model="summariser",
             include_usage=False,
             verbose=True,
@@ -471,6 +473,7 @@ class RootAndForkTests(HHTestCase):
         self.assertEqual(child.model, "parent-model")
         self.assertEqual(child.timeout, 7.0)
         self.assertEqual(child.local_timeout, 3.0)
+        self.assertEqual(child.max_tokens, 8)
         self.assertEqual(child.summary_model, "summariser")
         self.assertFalse(child.include_usage)
         self.assertTrue(child.verbose)
@@ -564,6 +567,7 @@ class TurnLifecycleTests(HHTestCase):
         self.assertEqual(started["context_len"], 1)
         self.assertTrue(started["include_usage"])
         self.assertFalse(started["verbose"])
+        self.assertEqual(started["max_tokens"], agent.DEFAULT_MAX_TOKENS)
         for event in events:
             self.assertEqual(event["agent_id"], block.id)
 
@@ -609,6 +613,7 @@ class TurnLifecycleTests(HHTestCase):
         self.assertEqual(request["messages"], 1)
         self.assertEqual(request["tools"], 0)
         self.assertEqual(request["depth"], 1)
+        self.assertEqual(request["max_tokens"], agent.DEFAULT_MAX_TOKENS)
         self.assertGreater(request["request_bytes"], 0)
 
         payload = pick(events, "request_payload")[0]
@@ -641,6 +646,7 @@ class TurnLifecycleTests(HHTestCase):
         self.assertEqual(payload["model"], "test-model")
         self.assertTrue(payload["stream"])
         self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual(payload["max_tokens"], agent.DEFAULT_MAX_TOKENS)
         self.assertEqual(
             payload["tools"],
             [
@@ -696,6 +702,11 @@ class TurnLifecycleTests(HHTestCase):
         self.provider.text("ok")
         self.run_turn(self.root(tools=[], include_usage=False).fork("hi"))
         self.assertNotIn("stream_options", self.provider.last_payload())
+
+    def test_max_tokens_zero_drops_the_cap(self):
+        self.provider.text("ok")
+        self.run_turn(self.root(tools=[], max_tokens=0).fork("hi"))
+        self.assertNotIn("max_tokens", self.provider.last_payload())
 
     def test_no_tools_key_when_the_block_has_none(self):
         self.provider.text("ok")

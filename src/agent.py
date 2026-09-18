@@ -19,6 +19,11 @@ DEFAULT_TIMEOUT = 120.0
 DEFAULT_LOCAL_TIMEOUT = 120.0
 MAX_TOOL_ROUNDS = 120
 
+# The default model takes max_tokens in [1, 393216], so the default cap is its own
+# maximum output. A block may override it; `0` sends no cap at all and leaves the
+# choice to the provider.
+DEFAULT_MAX_TOKENS = 393216
+
 # A hook receiving one event dict per thing that happens during a turn.
 EventHook = Callable[[dict[str, Any]], None]
 
@@ -391,6 +396,8 @@ class HHAgent:
     tools: dict[str, ToolEntry]
     timeout: float
     local_timeout: float
+    # output-token cap sent with every turn request; 0 sends no cap
+    max_tokens: int
     # model for failure summaries; empty means this block's own model
     summary_model: str
     include_usage: bool
@@ -414,6 +421,7 @@ class HHAgent:
         tools: Iterable[ToolEntry] = builtin_tools,
         timeout: float = DEFAULT_TIMEOUT,
         local_timeout: float = DEFAULT_LOCAL_TIMEOUT,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         summary_model: str = "",
         include_usage: bool = True,
         verbose: bool = False,
@@ -430,7 +438,10 @@ class HHAgent:
         tool call with its arguments and result, timings and token usage. The
         per-call `on_event` of `run`/`stream` takes precedence. `verbose` adds
         an event carrying each raw SSE chunk, and `include_usage` asks the
-        provider for token accounting on the final chunk.
+        provider for token accounting on the final chunk. `max_tokens` caps how
+        many tokens one turn request may produce; it defaults to the default
+        model's own maximum, and `0` leaves the cap to the provider. The
+        failure-summary request is separate and uncapped.
         """
         self = cls._blank()
         self.id = id or new_id()
@@ -440,6 +451,7 @@ class HHAgent:
         self.tools = {tool.name: tool for tool in tools}
         self.timeout = timeout
         self.local_timeout = local_timeout
+        self.max_tokens = max_tokens
         self.summary_model = summary_model
         self.include_usage = include_usage
         self.verbose = verbose
@@ -512,6 +524,7 @@ class HHAgent:
         child.tools = dict(self.tools)
         child.timeout = self.timeout
         child.local_timeout = self.local_timeout
+        child.max_tokens = self.max_tokens
         child.summary_model = self.summary_model
         child.include_usage = self.include_usage
         child.verbose = self.verbose
@@ -1182,6 +1195,7 @@ class HHAgent:
                 context_len=len(self.context()),
                 include_usage=self.include_usage,
                 verbose=self.verbose,
+                max_tokens=self.max_tokens,
             )
             # already in `messages` since fork; only announce it here
             self._announce(hook, self.messages[0], "fork")
@@ -1300,6 +1314,9 @@ class HHAgent:
             "messages": messages,
             "stream": True,
         }
+        if self.max_tokens > 0:
+            # unlike an absent field, an explicit cap is enforced by the provider
+            payload["max_tokens"] = self.max_tokens
         if schemas:
             # an empty list is not the same request as an absent one
             payload["tools"] = schemas
@@ -1319,6 +1336,7 @@ class HHAgent:
             tools=len(schemas),
             depth=self.depth,
             include_usage=self.include_usage,
+            max_tokens=self.max_tokens,
         )
         self._emit(
             hook,

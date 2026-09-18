@@ -61,6 +61,7 @@ def build(agent_id, parent=None, **fields):
     block.include_usage = fields.pop("include_usage", True)
     block.verbose = fields.pop("verbose", False)
     block.timeout = fields.pop("timeout", 5.0)
+    block.max_tokens = fields.pop("max_tokens", agent.DEFAULT_MAX_TOKENS)
     block.model = fields.pop("model", "test-model")
     block.local_timeout = fields.pop("local_timeout", agent.DEFAULT_LOCAL_TIMEOUT)
     if fields:
@@ -127,7 +128,7 @@ class ConstructionTests(StoreTestCase):
         for expected in (
             "id", "parent_id", "prompt", "messages", "state_deltas", "text",
             "error", "outcome", "dirty", "created_at", "endpoint", "model",
-            "timeout", "summary_model", "include_usage", "verbose",
+            "timeout", "max_tokens", "summary_model", "include_usage", "verbose",
             "tool_names", "local_tools",
         ):
             self.assertIn(expected, columns)
@@ -172,6 +173,7 @@ class ConstructionTests(StoreTestCase):
         self.assertIn("local_tools", columns)
         self.assertIn("outcome", columns)
         self.assertIn("summary_model", columns)
+        self.assertIn("max_tokens", columns)
 
         blocks, warnings = opened.load("restored-key")
         self.assertEqual(warnings, [])
@@ -184,6 +186,7 @@ class ConstructionTests(StoreTestCase):
         self.assertEqual(block.key, "restored-key")
         self.assertIsNone(block.outcome)
         self.assertEqual(block.summary_model, "")
+        self.assertEqual(block.max_tokens, agent.DEFAULT_MAX_TOKENS)
         self.assertEqual(block.merged_state("mem"), {"k": "v"})
 
     def test_without_fcntl_the_store_still_works(self):
@@ -232,6 +235,7 @@ class SaveLoadTests(StoreTestCase):
             verbose=True,
             model="other-model",
             timeout=12.5,
+            max_tokens=1234,
             tools=[tools.ToolEntry("remember", "d", [])],
         )
         store = self.open_store(tools=[tools.ToolEntry("remember", "d", [])])
@@ -253,6 +257,7 @@ class SaveLoadTests(StoreTestCase):
         self.assertEqual(loaded.endpoint, "http://provider.test")
         self.assertEqual(loaded.model, "other-model")
         self.assertEqual(loaded.timeout, 12.5)
+        self.assertEqual(loaded.max_tokens, 1234)
         self.assertEqual(loaded.summary_model, "summariser")
         self.assertFalse(loaded.include_usage)
         self.assertTrue(loaded.verbose)
@@ -283,6 +288,7 @@ class SaveLoadTests(StoreTestCase):
         block.endpoint = "http://elsewhere.test"
         block.model = "another-model"
         block.timeout = 3.5
+        block.max_tokens = 4321
         block.summary_model = "summariser"
         block.include_usage = False
         block.verbose = True
@@ -309,6 +315,7 @@ class SaveLoadTests(StoreTestCase):
         self.assertEqual(block.endpoint, "http://elsewhere.test")
         self.assertEqual(block.model, "another-model")
         self.assertEqual(block.timeout, 3.5)
+        self.assertEqual(block.max_tokens, 4321)
         self.assertEqual(block.summary_model, "summariser")
         self.assertFalse(block.include_usage)
         self.assertTrue(block.verbose)

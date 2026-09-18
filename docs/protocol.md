@@ -78,13 +78,14 @@ never dirty.
 | `local_tools` | optional definitions of tools the **client** runs (see below) |
 | `timeout` | optional read timeout in seconds |
 | `local_timeout` | optional seconds to wait for a local tool to be answered (default 120) |
+| `max_tokens` | optional output-token cap for every turn request; defaults to the default model's own maximum (393216), and `0` sends no cap (the failure-summary request is separate and uncapped) |
 | `summary_model` | optional model for failure summaries; defaults to the block's own |
 | `include_usage` | optional bool; asks the provider for token accounting |
 | `verbose` | optional bool; additionally emits raw `sse_chunk` events |
 
 → `agent_created` (`agent_id`, `parent: null`, `depth: 0`, `dirty`, `model`,
-`endpoint`, `timeout`, `include_usage`, `verbose`, `tools`, `local_tools`,
-`tool_schemas`).
+`endpoint`, `timeout`, `max_tokens`, `include_usage`, `verbose`, `tools`,
+`local_tools`, `tool_schemas`).
 
 Errors: `bad_id`, `missing_credentials`, `duplicate_agent`, `unknown_tool`,
 `bad_tools`, `bad_field`.
@@ -100,7 +101,7 @@ endpoint, key, model, tools and options, and **starts dirty**.
 | `prompt` | **required** — non-empty string |
 | `images` | optional — images sent with the prompt (see [Images](#images)) |
 | `new_id` | optional id for the new block; supply it to avoid waiting for the reply |
-| `model` `tools` `local_tools` `timeout` `local_timeout` `summary_model` `include_usage` `verbose` | optional overrides for the child only |
+| `model` `tools` `local_tools` `timeout` `local_timeout` `max_tokens` `summary_model` `include_usage` `verbose` | optional overrides for the child only |
 
 `tools` and `local_tools` are separate axes: supplying either replaces that half
 and carries the other half over, so a fork can add a local tool without losing
@@ -108,7 +109,7 @@ the inherited builtins.
 
 → `agent_forked` (`agent_id`, `parent`, `depth`, `dirty`, `prompt`,
 `prompt_chars`, `image_count`, `path` (ids root → child), `context_len`, `model`,
-`timeout`, `include_usage`, `verbose`, `tools`, `local_tools`,
+`timeout`, `max_tokens`, `include_usage`, `verbose`, `tools`, `local_tools`,
 `state_namespaces`).
 
 Errors: `bad_id`, `bad_prompt`, `bad_image`, `unknown_agent`, `parent_dirty`,
@@ -237,7 +238,7 @@ Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `outcome`
 `error`, `prompt_chars`, `prompt_preview`, `image_count`, `text_chars`,
 `local_len`, `context_len`, `model`, `summary_model`, `tools`, `local_tools`,
 `state_namespaces`, `waiting_on` (local calls this block is parked on),
-`include_usage`, `verbose`, `created_at`, `age_ms`.
+`max_tokens`, `include_usage`, `verbose`, `created_at`, `age_ms`.
 
 ### `destroy_agent`
 
@@ -319,7 +320,7 @@ unreadable row).
 
 | Event | Fields |
 |---|---|
-| `turn_started` | `prompt`, `prompt_chars`, `image_count`, `depth`, `path`, `model`, `tools`, `context_len`, `include_usage`, `verbose` |
+| `turn_started` | `prompt`, `prompt_chars`, `image_count`, `depth`, `path`, `model`, `tools`, `context_len`, `max_tokens`, `include_usage`, `verbose` |
 | `turn_finished` | `text`, `text_chars`, `rounds`, `tool_calls`, `elapsed_ms`, `messages`, `context_len`, `dirty: false` |
 | `turn_failed` | `error`, `error_type`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
 | `turn_cancelled` | `error`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
@@ -331,7 +332,7 @@ requests tools is followed by another round until the model answers with text.
 
 | Event | Fields |
 |---|---|
-| `request_started` | `round`, `url`, `model`, `timeout`, `request_bytes`, `messages`, `tools`, `depth`, `include_usage` |
+| `request_started` | `round`, `url`, `model`, `timeout`, `request_bytes`, `messages`, `tools`, `depth`, `max_tokens`, `include_usage` |
 | `request_payload` | `round`, `messages` — a per-message summary: `role`, `chars`, `image_count` when the message has images, and `tool_call_id` / `tool_calls` when present |
 | `response_received` | `round`, `status`, `reason`, `content_type`, `elapsed_ms` |
 | `request_finished` | `round`, `status`, `chunks`, `payload_chars`, `finish_reason`, `first_chunk_ms`, `elapsed_ms`, `cancelled` |

@@ -18,7 +18,11 @@ result = sandbox.exec(["python", "/work/main.py"])
 sandbox.destroy()
 ```
 
-It is not wired into the harness yet, and nothing in it imports the harness.
+It is wired into the harness as the `nix_*` tools (`src/sandbox_tools.py`): that
+module pins one configuration — 256M memory, 512M disk, 256 pids, one CPU, the
+host network, a writable `/workspace` — keeps each sandbox's id in memory, and
+destroys a sandbox that no tool call has named for ten minutes. Nothing in this
+package imports the harness.
 
 ## Layers
 

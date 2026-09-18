@@ -141,6 +141,13 @@ class SessionTests(ServerTestCase):
                 "get_magic_number",
                 "web_fetch",
                 "web_search",
+                "nix_spawn_sandbox",
+                "nix_sandbox_status",
+                "nix_add_dependency",
+                "nix_remove_dependency",
+                "nix_exec",
+                "nix_add_file",
+                "nix_destroy_sandbox",
             ],
         )
         setter = hello["tools"][2]
@@ -361,12 +368,19 @@ class CreateAgentTests(ServerTestCase):
                 "get_current_time",
                 "get_magic_number",
                 "get_system_info",
+                "nix_add_dependency",
+                "nix_add_file",
+                "nix_destroy_sandbox",
+                "nix_exec",
+                "nix_remove_dependency",
+                "nix_sandbox_status",
+                "nix_spawn_sandbox",
                 "set_magic_number",
                 "web_fetch",
                 "web_search",
             ],
         )
-        self.assertEqual(len(created["tool_schemas"]), 6)
+        self.assertEqual(len(created["tool_schemas"]), 13)
 
     def test_an_id_is_generated_when_omitted(self):
         fixture = self.start_server()
@@ -580,6 +594,13 @@ class ForkTests(ServerTestCase):
                 "get_current_time",
                 "get_magic_number",
                 "get_system_info",
+                "nix_add_dependency",
+                "nix_add_file",
+                "nix_destroy_sandbox",
+                "nix_exec",
+                "nix_remove_dependency",
+                "nix_sandbox_status",
+                "nix_spawn_sandbox",
                 "set_magic_number",
                 "web_fetch",
                 "web_search",

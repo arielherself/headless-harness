@@ -99,8 +99,10 @@ src/agent.py    HHAgent — one block of the chain; provider calls; state deltas
 src/server.py   HHServer — TCP listener, registry, JSONL protocol, eviction
 src/store.py    HHStore  — SQLite mirror, size budget, subtree eviction
 src/tools.py    ToolEntry / ToolContext / ToolResult and the builtin tools
+src/sandbox_tools.py  the live-sandbox registry behind the `nix_*` tools
 src/main.py     empty placeholder
 src/protocol.py the wire-protocol version shared by the server and the tools
+sandbox/        the sandbox itself: Nix + bubblewrap + cgroup v2 + seccomp
 test.py         interactive client (gitignored: it holds the API key)
 tests/          the test-suite (see Tests above)
 docs/           this documentation

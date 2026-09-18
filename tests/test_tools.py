@@ -64,7 +64,7 @@ class ToolContextTests(unittest.TestCase):
 
 
 class BuiltinToolTests(unittest.TestCase):
-    def test_the_catalogue_is_the_six_builtins(self):
+    def test_the_catalogue_is_the_core_builtins_then_the_sandbox_tools(self):
         self.assertEqual(
             [tool.name for tool in tools.builtin_tools],
             [
@@ -74,6 +74,13 @@ class BuiltinToolTests(unittest.TestCase):
                 "get_magic_number",
                 "web_fetch",
                 "web_search",
+                "nix_spawn_sandbox",
+                "nix_sandbox_status",
+                "nix_add_dependency",
+                "nix_remove_dependency",
+                "nix_exec",
+                "nix_add_file",
+                "nix_destroy_sandbox",
             ],
         )
 
@@ -193,8 +200,12 @@ class BuiltinToolTests(unittest.TestCase):
         )
         self.assertEqual(tools.get_magic_number_tool.params, [])
 
-    def test_the_builtins_promise_nothing_they_do_not_have(self):
+    def test_the_core_builtins_promise_nothing_they_do_not_have(self):
+        # the nix_* tools are the other half of the catalogue: they wrap a real
+        # sandbox and say so, while these six only read
         for tool in tools.builtin_tools:
+            if tool.name.startswith("nix_"):
+                continue
             self.assertFalse(tool.external_effects)
             self.assertFalse(tool.has_rollback)
             self.assertFalse(tool.is_local)

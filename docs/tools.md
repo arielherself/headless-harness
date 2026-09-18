@@ -291,6 +291,13 @@ lucky.
 | `get_magic_number` | `magic` | reads it back |
 | `web_fetch` | `web_fetch` | reads a URL through Jina's reader and returns Jina's Markdown of the page |
 | `web_search` | `web_search` | searches through Exa and returns short excerpts (title, URL, highlights) of the top results |
+| `nix_spawn_sandbox` | `nix_spawn_sandbox` | creates the one sandbox shape and returns its id |
+| `nix_sandbox_status` | `nix_sandbox_status` | reports whether an id is still live, with its age, last use and packages |
+| `nix_add_dependency` | `nix_add_dependency` | installs one Nix package for the next command |
+| `nix_remove_dependency` | `nix_remove_dependency` | removes a package; bash and coreutils cannot go |
+| `nix_exec` | `nix_exec` | runs one shell line; the timeout is required and at most 600s |
+| `nix_add_file` | `nix_add_file` | writes one base64 file into the writable `/workspace` |
+| `nix_destroy_sandbox` | `nix_destroy_sandbox` | stops it and deletes its files now |
 
 The `magic` pair is the worked example of a shared namespace, and the pair used to
 test that forking rewinds state. Before they declared `state_namespace="magic"`
@@ -310,6 +317,47 @@ back truncated with a note saying how much was cut.
 returns their titles, URLs and excerpts, which is what you want before you have a
 URL at all. It needs no key either, Exa rate-limits the free endpoint by IP, and —
 like `web_fetch` — it only reads, so it declares no external effects.
+
+### The sandbox tools
+
+The `nix_*` tools are the harness's side of the `sandbox/` package: they run
+untrusted commands in a bubblewrap sandbox built from a Nix environment. Their
+implementation lives in `src/sandbox_tools.py`, and they behave differently from
+the tools above in four ways worth knowing.
+
+**There is one fixed configuration, and spawn takes no parameters.** Every
+sandbox gets 256M of memory, 512M of disk, 256 pids, one CPU, the host network,
+and a writable `/workspace` that is also the working directory. The model chooses
+what runs in a sandbox, never how much of the machine it gets. A new sandbox
+starts with bash and coreutils; `nix_add_dependency` installs more Nix packages,
+one per call, into the environment the next `nix_exec` sees.
+
+**Ids are memory, not state.** `nix_spawn_sandbox` returns an id like
+`sbx-3f2a9c1b7d0e`, and every other `nix_*` tool takes it. The registry is
+process-wide and in-memory, so nothing is written to a block's state: forking a
+block rewinds tool memory but cannot resurrect a sandbox, and a restarted server
+has forgotten every id. `nix_sandbox_status` is how the model tells whether a
+sandbox it created earlier still exists — it reports age, last use and packages,
+or says the sandbox was released.
+
+**Idle sandboxes are released, and there is a cap.** A daemon thread sweeps every
+20 minutes and destroys every sandbox that no tool call has named for 10 minutes;
+any call about a sandbox — even one that fails — restarts its clock, and a call
+that is still running protects it for its whole duration. At most 10
+sandboxes exist at once, and one more `nix_spawn_sandbox` is refused rather than
+evicting anybody's work. `nix_destroy_sandbox` ends one immediately.
+
+**`nix_exec` always takes a timeout, and `nix_add_file` takes bytes as base64.**
+The timeout is required and must be between 1 and 600 seconds; a command that
+outlives it is killed and the partial output is returned with exit code 124. Each
+command runs in fresh namespaces, so background processes do not survive from one
+call to the next and only files under `/workspace` persist — which is where
+`nix_add_file` can put a file, handed over as a base64 string because a tool call
+is JSON. A file whose content starts with `#!` is made executable.
+
+All of them but `nix_sandbox_status` declare `external_effects`: they create,
+destroy and change things outside the tool state, so a failed turn's note lists
+them rather than letting the next model assume the environment is clean.
 
 ## Checklist
 

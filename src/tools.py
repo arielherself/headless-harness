@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 
+import sandbox_tools
 from protocol import PROTOCOL_VERSION
 
 if TYPE_CHECKING:  # only for the annotation below; agent imports this module
@@ -366,6 +367,193 @@ web_search_tool = ToolEntry(
 )
 
 
+# The sandbox tools. The sandbox itself is the `sandbox` package at the project
+# root; `sandbox_tools.py` owns the registry and the fixed configuration, and
+# these entries are the model's side of it. Ids live in memory and in the
+# conversation, never in tool state: forking a block rewinds tool memory but
+# cannot resurrect a sandbox, which `nix_sandbox_status` makes observable.
+
+
+def nix_spawn_sandbox_executor(context: ToolContext) -> str:
+    return sandbox_tools.SANDBOXES.spawn()
+
+
+nix_spawn_sandbox_tool = ToolEntry(
+    name="nix_spawn_sandbox",
+    description=(
+        "Create an isolated Nix sandbox and return its id; every other nix_* "
+        "tool takes that id. The sandbox has a fixed shape that cannot be "
+        "changed: 256M memory, 512M disk, 256 processes, one CPU, network "
+        "access, and a writable /workspace that is also the working directory. "
+        "It starts with only bash and coreutils, so install what you need with "
+        "nix_add_dependency. Use it — rather than the machine the harness runs "
+        "on — for untrusted code, package installs and anything else that "
+        "should be contained, and destroy it with nix_destroy_sandbox when the "
+        "work is done."
+    ),
+    params=[],
+    hook=nix_spawn_sandbox_executor,
+    external_effects=True,
+)
+
+
+def nix_sandbox_status_executor(context: ToolContext, sandbox_id: str) -> str:
+    return sandbox_tools.SANDBOXES.status(sandbox_id)
+
+
+nix_sandbox_status_tool = ToolEntry(
+    name="nix_sandbox_status",
+    description=(
+        "Report whether a sandbox is still live, with its age, last use and "
+        "installed packages. Sandboxes are released when destroyed, after ten "
+        "minutes without a call, or when the harness restarts, because ids are "
+        "kept in memory only — so ask before assuming a sandbox you created "
+        "earlier still exists. Calling this also counts as using the sandbox "
+        "and restarts its idle clock."
+    ),
+    params=[
+        ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
+    ],
+    hook=nix_sandbox_status_executor,
+    external_effects=False,
+)
+
+
+def nix_add_dependency_executor(context: ToolContext, sandbox_id: str, package: str) -> str:
+    return sandbox_tools.SANDBOXES.add_dependency(sandbox_id, package)
+
+
+nix_add_dependency_tool = ToolEntry(
+    name="nix_add_dependency",
+    description=(
+        "Install one Nix package into a live sandbox (python312, git, "
+        "ripgrep, ...). The change applies to the next nix_exec; if Nix cannot "
+        "build the package, the sandbox keeps the environment it had. Add one "
+        "package per call."
+    ),
+    params=[
+        ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
+        ToolParam(
+            name="package",
+            type="string",
+            description="Nix package name, e.g. python312, git or ripgrep",
+        ),
+    ],
+    hook=nix_add_dependency_executor,
+    external_effects=True,
+)
+
+
+def nix_remove_dependency_executor(context: ToolContext, sandbox_id: str, package: str) -> str:
+    return sandbox_tools.SANDBOXES.remove_dependency(sandbox_id, package)
+
+
+nix_remove_dependency_tool = ToolEntry(
+    name="nix_remove_dependency",
+    description=(
+        "Remove one Nix package from a live sandbox. bash and coreutils are "
+        "always present and cannot be removed. The change applies to the next "
+        "nix_exec."
+    ),
+    params=[
+        ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
+        ToolParam(
+            name="package",
+            type="string",
+            description="Nix package name to remove, as passed to nix_add_dependency",
+        ),
+    ],
+    hook=nix_remove_dependency_executor,
+    external_effects=True,
+)
+
+
+def nix_exec_executor(
+    context: ToolContext, sandbox_id: str, command: str, timeout: int
+) -> str:
+    return sandbox_tools.SANDBOXES.exec(sandbox_id, command, timeout)
+
+
+nix_exec_tool = ToolEntry(
+    name="nix_exec",
+    description=(
+        "Run one shell command in a live sandbox and wait for it, returning "
+        "its exit code, stdout and stderr. `command` is passed to `bash -c`. "
+        "`timeout` is required and may not exceed 600 seconds; a command "
+        "that outlives it is killed. Each call runs in fresh namespaces: "
+        "background processes from an earlier call are gone, and only files "
+        "under /workspace persist."
+    ),
+    params=[
+        ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
+        ToolParam(
+            name="command",
+            type="string",
+            description="the shell command line to run, e.g. 'python3 /workspace/main.py'",
+        ),
+        ToolParam(
+            name="timeout",
+            type="integer",
+            description="seconds to wait before the command is killed; at most 600",
+        ),
+    ],
+    hook=nix_exec_executor,
+    external_effects=True,
+)
+
+
+def nix_add_file_executor(
+    context: ToolContext, sandbox_id: str, path: str, content_base64: str
+) -> str:
+    return sandbox_tools.SANDBOXES.add_file(sandbox_id, path, content_base64)
+
+
+nix_add_file_tool = ToolEntry(
+    name="nix_add_file",
+    description=(
+        "Write one file into a live sandbox at `path`, which must be under "
+        "the writable /workspace. `content_base64` is the file's bytes, "
+        "base64-encoded, so text and binary files both work; a file whose "
+        "content starts with '#!' is made executable. The file lives as long "
+        "as the sandbox."
+    ),
+    params=[
+        ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
+        ToolParam(
+            name="path",
+            type="string",
+            description="absolute destination path inside the sandbox, e.g. /workspace/main.py",
+        ),
+        ToolParam(
+            name="content_base64",
+            type="string",
+            description="the file's bytes as a base64 string (standard alphabet; padding optional)",
+        ),
+    ],
+    hook=nix_add_file_executor,
+    external_effects=True,
+)
+
+
+def nix_destroy_sandbox_executor(context: ToolContext, sandbox_id: str) -> str:
+    return sandbox_tools.SANDBOXES.destroy(sandbox_id)
+
+
+nix_destroy_sandbox_tool = ToolEntry(
+    name="nix_destroy_sandbox",
+    description=(
+        "Destroy a sandbox now: stop anything still running, delete its files "
+        "and free its slot. Call it as soon as you are done; an idle sandbox "
+        "is released automatically, but not instantly."
+    ),
+    params=[
+        ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
+    ],
+    hook=nix_destroy_sandbox_executor,
+    external_effects=True,
+)
+
+
 builtin_tools = [
     get_system_info_tool,
     get_current_time_tool,
@@ -373,4 +561,11 @@ builtin_tools = [
     get_magic_number_tool,
     web_fetch_tool,
     web_search_tool,
+    nix_spawn_sandbox_tool,
+    nix_sandbox_status_tool,
+    nix_add_dependency_tool,
+    nix_remove_dependency_tool,
+    nix_exec_tool,
+    nix_add_file_tool,
+    nix_destroy_sandbox_tool,
 ]

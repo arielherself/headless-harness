@@ -30,6 +30,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import agent  # noqa: E402
+import sandbox_tools  # noqa: E402
 import server  # noqa: E402
 import store  # noqa: E402
 import tools  # noqa: E402

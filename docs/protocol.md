@@ -196,7 +196,8 @@ landmine for the next turn.
 → `context` (`depth`, `path`, `context` — the flattened messages that would be
 sent, `context_len`, `local_len` — how many of them this block owns, `messages` —
 this block's own list, `pipe_traces` — one record per tool pipe this block's own
-turn ran, see [Tool pipes](#tool-pipes)).
+turn ran *in this process*, see [Tool pipes](#tool-pipes); traces are never
+stored, so a block restored from the store reports none).
 
 ### `get_state` / `set_state`
 
@@ -239,7 +240,8 @@ Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `outcome`
 `error`, `prompt_chars`, `prompt_preview`, `image_count`, `text_chars`,
 `local_len`, `context_len`, `model`, `summary_model`, `tools`, `local_tools`,
 `state_namespaces`, `waiting_on` (local calls this block is parked on),
-`pipe_traces` (how many this block's own turn ran), `max_tokens`, `include_usage`,
+`pipe_traces` (how many this block's own turn ran in this process; traces are
+not persisted, so a restart reports none), `max_tokens`, `include_usage`,
 `verbose`, `created_at`, `age_ms`.
 
 ### `destroy_agent`
@@ -466,9 +468,11 @@ wrote /workspace/photo.jpg (184320 bytes)
 ```
 
 Everything in between — the arguments each step was given, what it returned and
-when — is recorded on the block and reported through events, but never sent to the
-provider. A client can therefore download a file and pipe its bytes into
-`nix_add_file` without the model ever quoting a base64 payload.
+when — is recorded on the block for the life of the process and reported through
+events, but never sent to the provider and never written to the store: a pipe
+exists precisely because its middle is too big to keep. A client can therefore
+download a file and pipe its bytes into `nix_add_file` without the model ever
+quoting a base64 payload.
 
 A server hook does it in code:
 
@@ -520,7 +524,8 @@ Rules worth knowing:
   records as `pipe_traces`, each holding `call_id`, `round`, `chain`, `ok`,
   `error`, `result`, `result_chars`, `elapsed_ms` and one `steps` entry per call
   (`call_id`, `name`, `via`, `arguments`, `ok`, `error`, `text`, `text_chars`,
-  `image_count`, `next`, `elapsed_ms`).
+  `image_count`, `next`, `elapsed_ms`). The records are never persisted: they are
+  served for the life of the process, and a restarted block has none.
 - **Every step rolls back with the turn.** A failed, cancelled or abandoned turn
   offers each call it made an undo, the pipe's steps included, newest first.
 - **A client's piped `call` travels over this connection**, so the 8 MiB command

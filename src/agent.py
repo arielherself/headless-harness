@@ -509,8 +509,9 @@ class HHAgent:
     A tool may also answer with a call instead of text, and the harness runs it
     before the model is consulted again: a **pipe**. Only the tools the pipe
     called and the last call's output are shown to the model; every step's
-    arguments and result stay in `pipe_traces`, and each step is recorded as a
-    call of its own, so a failed turn can undo them all, newest first.
+    arguments and result stay in `pipe_traces`, in memory for the life of the
+    process but never written to the store, and each step is recorded as a call
+    of its own, so a failed turn can undo them all, newest first.
     """
 
     id: str
@@ -539,7 +540,8 @@ class HHAgent:
     # keyed by namespace: a tool's `state_namespace`, or its name when unset
     state_deltas: dict[str, StateDelta]
     # one record per pipe this block's own turn ran, for inspection and for
-    # `get_context`; the model never sees any of it (see `_run_call`)
+    # `get_context`; the model never sees any of it (see `_run_call`), and the
+    # store never keeps it
     pipe_traces: list[dict[str, Any]]
     _cancel: threading.Event
     _run_lock: threading.Lock
@@ -1732,7 +1734,8 @@ class HHAgent:
         carries on until one of them returns text. Only the tools the pipe
         called and the last call's output reach the model; each step's own
         arguments and result are kept in `pipe_traces` and reported through
-        events, so they can be inspected without ever entering the transcript.
+        events, so they can be inspected without ever entering the transcript —
+        or the database, which they are deliberately never written to.
 
         Every step is also a `_Call` of its own, recorded as it runs, so a turn
         that does not commit offers each of them an undo, newest first.

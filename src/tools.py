@@ -35,9 +35,9 @@ class ToolCall:
     for a model to quote (a file's bytes, a page of HTML) can travel through a
     pipe without ever entering the transcript. Only the tools a pipe called and
     the *last* call's output reach the model; what the earlier calls returned,
-    arguments included, is recorded on the block for inspection (see
+    arguments included, is recorded in memory for inspection (see
     `HHAgent.pipe_traces`) and reported through events, but never sent to the
-    provider.
+    provider and never written to the store.
     """
 
     name: str

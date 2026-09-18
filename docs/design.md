@@ -245,7 +245,7 @@ The motivation is the transcript. A file's bytes are exactly the kind of thing a
 tool can hold but a model should never have to quote: routing them through a
 tool-call argument would make every later request carry the base64, at token
 cost, for information the model cannot use. A pipe keeps the value where it
-belongs — in the process, and in the block's own record — while still letting the
+belongs — in the process, for the life of the turn — while still letting the
 model ask for the work in one call and see it done.
 
 Three decisions shape the implementation.
@@ -256,14 +256,17 @@ Anything else the steps said is dropped from the transcript, not summarised, so
 there is no way for an intermediate value to leak back in — including through
 the tool message, which is built from the final reply alone.
 
-**The middle is still recorded.** `HHAgent.pipe_traces` keeps one record per
-pipe: the chain, each step's call id, `via`, arguments, its own result and
-whether it failed. `get_context` serves them, and `pipe_step_started` /
+**The middle is recorded live, never stored.** `HHAgent.pipe_traces` keeps one
+record per pipe: the chain, each step's call id, `via`, arguments, its own result
+and whether it failed. `get_context` serves them, and `pipe_step_started` /
 `pipe_step_finished` report them live, so "what actually ran" is inspectable
-even though "what the model saw" is deliberately small. Values are stored
-bounded — a prefix, the true length and a digest — since a step may legitimately
-carry a megabyte, and the database's budget is sized for conversations, not for
-payloads that live in the sandbox anyway.
+even though "what the model saw" is deliberately small. Values are kept bounded
+— a prefix, the true length and a digest — since a step may legitimately carry a
+megabyte. The records live in memory only, for the life of the process: the
+point of a pipe is that its middle may be a file's bytes, and the database's
+budget is sized for conversations, not for payloads that stay in the sandbox. A
+restart therefore has no traces, and nothing else is lost with them — the
+transcript and the per-call record rollback uses are built from other data.
 
 **Every step is a call in its own right.** Each one is recorded in the turn's
 call list with its own derived id (`call_1:pipe:1`), so rollback walks them
@@ -290,6 +293,10 @@ and the settings that shape a turn.
 - **State as JSON.** `ToolContext.state` may hold any Python object, so deltas
   are pickled. Each namespace is checked individually: one tool whose state
   refuses to pickle costs only that tool's state, and `persist_warning` says so.
+- **Tool pipe traces.** The middle of a pipe is reported live but never written:
+  it is inspection data whose values may be large, and losing it on a restart
+  costs nothing the store is relied on for, since the transcript and the
+  per-call record rollback uses are kept separately.
 
 **Write points.** A block is written twice: once at `fork` (holding just the
 prompt and any images) and once when its turn ends. Nothing is written during a turn, so a

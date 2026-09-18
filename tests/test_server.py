@@ -1939,7 +1939,7 @@ class PersistenceTests(ServerTestCase):
         entry = [a for a in listed["agents"] if a["agent_id"] == "a1"][0]
         self.assertEqual(entry["image_count"], 1)
 
-    def test_pipe_traces_survive_a_restart(self):
+    def test_pipe_traces_do_not_survive_a_restart(self):
         fixture = self.start_server()
         client = fixture.client()
         self.create(client, "root", local_tools=[{"name": "fetch_file"}])
@@ -1958,17 +1958,28 @@ class PersistenceTests(ServerTestCase):
             call={"name": "set_magic_number", "arguments": {"magic": "kept"}},
         )
         client.wait_event("command_finished", since=mark, rid="r1")
+
+        # the process that ran the pipe can still show it
+        client.command("get_context", id="a1")
+        self.assertEqual(len(client.wait_event("context")["pipe_traces"]), 1)
         self.stop_server(fixture)
 
         second = self.start_server()
         client = second.client()
         client.command("get_context", id="a1")
         event = client.wait_event("context")
-        self.assertEqual(len(event["pipe_traces"]), 1)
-        trace = event["pipe_traces"][0]
-        self.assertEqual(trace["chain"], ["fetch_file", "set_magic_number"])
-        self.assertEqual(trace["steps"][1]["arguments"], {"magic": "kept"})
-        self.assertEqual(trace["steps"][1]["text"], "Magic is set to kept")
+        # a trace is inspection data, not part of the conversation, and the
+        # store never keeps it: a restarted block reports none
+        self.assertEqual(event["pipe_traces"], [])
+        client.command("list_agents")
+        listed = client.wait_event("agents_listed")
+        entry = [a for a in listed["agents"] if a["agent_id"] == "a1"][0]
+        self.assertEqual(entry["pipe_traces"], 0)
+        # what the turn really owns survives: the transcript and the pipe note
+        self.assertEqual(
+            self.fetch_block(second, "a1").messages[2]["content"],
+            "[tool pipe] fetch_file -> set_magic_number\nMagic is set to kept",
+        )
 
     def test_a_restart_keeps_local_tool_definitions(self):
         fixture = self.start_server()

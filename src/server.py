@@ -72,10 +72,11 @@ tool can do the same by answering `resolve_tool` with `call` instead of `result`
 and either kind may hand off to the other. Only the tools a pipe called and the
 last call's output are shown to the model: the tool message becomes
 `[tool pipe] first -> second\n<the last result>`. Each step's arguments and
-result are recorded on the block (`get_context` returns them as `pipe_traces`)
+result are recorded in memory (`get_context` returns them as `pipe_traces`)
 and reported by the `pipe_step_started` / `pipe_step_finished` events, but never
-sent to the provider — which is the point, since a step may carry a file's bytes
-that the model must not have to quote. A pipe runs without the model in the
+sent to the provider or written to the database — which is the point, since a
+step may carry a file's bytes that the model must not have to quote, and that a
+restart must not be asked to keep. A pipe runs without the model in the
 loop, so it is bounded to `MAX_PIPE_DEPTH` calls before it is cut off with a
 `pipe_depth` error; every step that reached a tool is rolled back with the turn
 if the turn does not commit.
@@ -654,7 +655,8 @@ class HHServer(socketserver.ThreadingTCPServer):
             local_len=len(block.messages),
             messages=block.messages,
             # what the block's own tool pipes did, step by step, with their
-            # intermediate values bounded: for inspection, never for the model
+            # intermediate values bounded: for inspection only, never for the
+            # model and never for the store
             pipe_traces=block.pipe_traces,
         )
 

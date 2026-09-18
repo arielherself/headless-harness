@@ -41,7 +41,7 @@ OLD_COLUMNS = (
 
 
 def build(agent_id, parent=None, **fields):
-    """A block with the fields the store persists, set explicitly."""
+    """A block with the fields a round trip could carry, set explicitly."""
     block = agent.HHAgent.root(
         "http://provider.test",
         "secret-key",
@@ -130,9 +130,11 @@ class ConstructionTests(StoreTestCase):
             "id", "parent_id", "prompt", "messages", "state_deltas", "text",
             "error", "outcome", "dirty", "created_at", "endpoint", "model",
             "timeout", "max_tokens", "summary_model", "include_usage", "verbose",
-            "tool_names", "local_tools", "pipe_traces",
+            "tool_names", "local_tools",
         ):
             self.assertIn(expected, columns)
+        # pipe traces are deliberately not stored, so the column does not exist
+        self.assertNotIn("pipe_traces", columns)
 
     def test_pragmas_are_the_ones_eviction_relies_on(self):
         opened = self.open_store()
@@ -175,7 +177,6 @@ class ConstructionTests(StoreTestCase):
         self.assertIn("outcome", columns)
         self.assertIn("summary_model", columns)
         self.assertIn("max_tokens", columns)
-        self.assertIn("pipe_traces", columns)
 
         blocks, warnings = opened.load("restored-key")
         self.assertEqual(warnings, [])
@@ -190,7 +191,7 @@ class ConstructionTests(StoreTestCase):
         self.assertEqual(block.summary_model, "")
         self.assertEqual(block.max_tokens, agent.DEFAULT_MAX_TOKENS)
         self.assertEqual(block.merged_state("mem"), {"k": "v"})
-        # a block written before pipe traces existed simply has none
+        # traces are never restored: a loaded block starts with none
         self.assertEqual(block.pipe_traces, [])
 
     def test_without_fcntl_the_store_still_works(self):
@@ -215,6 +216,36 @@ class ConstructionTests(StoreTestCase):
         opened = self.open_store()
         self.assertEqual(opened._db.execute("SELECT COUNT(*) FROM blocks").fetchone()[0], 0)
 
+    def test_a_file_with_stored_pipe_traces_loses_the_column_and_its_bytes(self):
+        # an older version kept a block's pipe traces in a column of their own,
+        # which is what this version stopped doing: opening such a file drops
+        # the column, and since the values are what made the file big, the
+        # freed pages are truncated too
+        opened = self.open_store()
+        opened.save(build("a1", prompt="hello"))
+        self.close_store(opened)
+
+        connection = self.raw()
+        with connection:
+            connection.execute(
+                "ALTER TABLE blocks ADD COLUMN pipe_traces TEXT NOT NULL DEFAULT '[]'"
+            )
+            connection.execute(
+                "UPDATE blocks SET pipe_traces = ?",
+                (json.dumps([{"call_id": "c1", "steps": [{"text": "x" * 200_000}]}]),),
+            )
+        connection.close()
+        big = self.path.stat().st_size
+
+        opened = self.open_store()
+        columns = {row["name"] for row in opened._db.execute("PRAGMA table_info(blocks)")}
+        self.assertNotIn("pipe_traces", columns)
+        self.assertLess(opened.size_bytes(), big)
+        blocks, warnings = opened.load("restored-key")
+        self.assertEqual(warnings, [])
+        self.assertEqual([block.id for block in blocks], ["a1"])
+        self.assertEqual(blocks[0].prompt, "hello")
+
 
 # --- saving and loading --------------------------------------------------
 
@@ -222,31 +253,6 @@ class ConstructionTests(StoreTestCase):
 class SaveLoadTests(StoreTestCase):
     def test_round_trip_keeps_every_field(self):
         state = agent.StateDelta(changed={"colour": "blue", "n": 3}, removed=("old",))
-        trace = {
-            "call_id": "c1",
-            "round": 1,
-            "chain": ["fetch", "write_file"],
-            "ok": True,
-            "error": None,
-            "result": "wrote 4 bytes",
-            "result_chars": 13,
-            "elapsed_ms": 1.5,
-            "steps": [
-                {
-                    "call_id": "c1",
-                    "name": "fetch",
-                    "via": "server",
-                    "arguments": {"url": "https://x.test/f"},
-                    "ok": True,
-                    "error": None,
-                    "text": "",
-                    "text_chars": 0,
-                    "image_count": 0,
-                    "next": "write_file",
-                    "elapsed_ms": 0.5,
-                }
-            ],
-        }
         original = build(
             "a1",
             prompt="hello",
@@ -259,7 +265,8 @@ class SaveLoadTests(StoreTestCase):
             dirty=False,
             created_at=99.5,
             state_deltas={"mem": state},
-            pipe_traces=[trace],
+            # on the block, but not something the store is allowed to keep
+            pipe_traces=[{"call_id": "c1", "chain": ["fetch", "write_file"], "steps": []}],
             summary_model="summariser",
             include_usage=False,
             verbose=True,
@@ -294,7 +301,8 @@ class SaveLoadTests(StoreTestCase):
         self.assertEqual(loaded.key, "server-key")
         self.assertEqual(sorted(loaded.tools), ["remember"])
         self.assertEqual(loaded.state_deltas, {"mem": state})
-        self.assertEqual(loaded.pipe_traces, [trace])
+        # the trace was on the original block but is not persisted at all
+        self.assertEqual(loaded.pipe_traces, [])
         # the local timeout is not persisted; blocks fall back to the default
         self.assertEqual(loaded.local_timeout, agent.DEFAULT_LOCAL_TIMEOUT)
 
@@ -311,7 +319,6 @@ class SaveLoadTests(StoreTestCase):
         block.prompt = "a new prompt"
         block.messages = [{"role": "assistant", "content": "changed"}]
         block.state_deltas = {"mem": agent.StateDelta(changed={"k": "v"}, removed=("gone",))}
-        block.pipe_traces = [{"call_id": "c9", "chain": ["a", "b"]}]
         block.text = "the new text"
         block.error = "the new error"
         block.outcome = "failed"
@@ -339,7 +346,6 @@ class SaveLoadTests(StoreTestCase):
             block.state_deltas,
             {"mem": agent.StateDelta(changed={"k": "v"}, removed=("gone",))},
         )
-        self.assertEqual(block.pipe_traces, [{"call_id": "c9", "chain": ["a", "b"]}])
         self.assertEqual(block.text, "the new text")
         self.assertEqual(block.error, "the new error")
         self.assertEqual(block.outcome, "failed")
@@ -483,40 +489,6 @@ class DamageTests(StoreTestCase):
         blocks, warnings = reopened.load("k")
         self.assertEqual(blocks[0].state_deltas, {})
         self.assertIn("expected a dict, got list", warnings[0])
-
-    def test_unreadable_pipe_traces_are_emptied_but_the_block_is_kept(self):
-        store = self.open_store()
-        store.save(build("a1", pipe_traces=[{"call_id": "c1"}]))
-        self.close_store(store)
-        connection = self.raw()
-        with connection:
-            connection.execute(
-                "UPDATE blocks SET pipe_traces = ? WHERE id = ?", ("{oops", "a1")
-            )
-        connection.close()
-
-        reopened = self.open_store()
-        blocks, warnings = reopened.load("k")
-        self.assertEqual([block.id for block in blocks], ["a1"])
-        self.assertEqual(blocks[0].pipe_traces, [])
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("pipe traces unreadable", warnings[0])
-
-    def test_pipe_traces_that_are_not_a_list_are_reported(self):
-        store = self.open_store()
-        store.save(build("a1"))
-        self.close_store(store)
-        connection = self.raw()
-        with connection:
-            connection.execute(
-                "UPDATE blocks SET pipe_traces = ? WHERE id = ?", ('{"a": 1}', "a1")
-            )
-        connection.close()
-
-        reopened = self.open_store()
-        blocks, warnings = reopened.load("k")
-        self.assertEqual(blocks[0].pipe_traces, [])
-        self.assertIn("pipe traces were not a list", warnings[0])
 
     def test_a_row_whose_messages_are_broken_still_holds_its_children(self):
         # the loader keeps a broken row rather than dropping it: dropping it

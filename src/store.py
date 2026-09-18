@@ -5,12 +5,14 @@ restart can rebuild the same chains.
 
 Per block it stores identity and linkage (`id`, `parent_id`), the conversation
 the block owns (`prompt`, `messages`, `text`, `error`), its tool state deltas,
-the traces of the tool pipes its turn ran (`pipe_traces`), its lifecycle flags
-(`dirty`, `created_at`) and the settings that shape a turn (`endpoint`, `model`,
-`timeout`, `max_tokens`, `include_usage`, `verbose`). Tools are stored by *name*
-and resolved against the catalogue on load, because a hook is a function and
-cannot be persisted. The API key is never written, so blocks restored from disk
-inherit whatever key the server was started with.
+its lifecycle flags (`dirty`, `created_at`) and the settings that shape a turn
+(`endpoint`, `model`, `timeout`, `max_tokens`, `include_usage`, `verbose`). Tools
+are stored by *name* and resolved against the catalogue on load, because a hook
+is a function and cannot be persisted. The API key is never written, so blocks
+restored from disk inherit whatever key the server was started with. The traces
+of the tool pipes a block's turn ran are not written either: they are inspection
+data whose values may be large, so they live in memory for the life of the
+process and a restart simply has none.
 
 A block is written once when it is forked and once when its turn ends, so a
 process that dies mid-turn leaves the block looking forked-but-never-run and the
@@ -60,8 +62,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     verbose       INTEGER NOT NULL,
     tool_names    TEXT NOT NULL,
     local_tools   TEXT NOT NULL DEFAULT '[]',
-    summary_model TEXT NOT NULL DEFAULT '',
-    pipe_traces   TEXT NOT NULL DEFAULT '[]'
+    summary_model TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS blocks_parent ON blocks (parent_id);
 CREATE INDEX IF NOT EXISTS blocks_created ON blocks (created_at);
@@ -70,14 +71,14 @@ CREATE INDEX IF NOT EXISTS blocks_created ON blocks (created_at);
 COLUMNS = (
     "id, parent_id, prompt, messages, state_deltas, text, error, outcome, dirty, "
     "created_at, endpoint, model, timeout, max_tokens, summary_model, "
-    "include_usage, verbose, tool_names, local_tools, pipe_traces"
+    "include_usage, verbose, tool_names, local_tools"
 )
 
 # Columns refreshed when a block that already has a row changes.
 UPDATABLE = (
     "prompt, messages, state_deltas, text, error, outcome, dirty, created_at, "
     "endpoint, model, timeout, max_tokens, summary_model, include_usage, verbose, "
-    "tool_names, local_tools, pipe_traces"
+    "tool_names, local_tools"
 )
 
 # Columns added after the first release. SQLite has no `ADD COLUMN IF NOT
@@ -89,9 +90,14 @@ ADDED_COLUMNS = (
     # blocks written before the cap existed fall back to the same default a
     # fresh block gets, rather than to no cap at all
     ("max_tokens", f"INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_TOKENS)}"),
-    # pipe traces are inspect-only, so an older block simply has none
-    ("pipe_traces", "TEXT NOT NULL DEFAULT '[]'"),
 )
+
+# Columns a later version stopped storing. `pipe_traces` held a tool pipe's
+# intermediate arguments and results — the payloads a pipe exists to keep out of
+# the transcript — so an older file has the column dropped, payloads and all,
+# which is also what gives the space back. SQLite has supported `DROP COLUMN`
+# since 3.35.
+DROPPED_COLUMNS = ("pipe_traces",)
 
 # A subtree that may be reclaimed: a root, or a block whose parent has forks.
 CANDIDATES = """
@@ -154,13 +160,19 @@ class HHStore:
         """Bring a file written by an older version up to the current schema.
 
         SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list is checked
-        first. Only additive changes are handled here; anything structural would
-        need a real migration step.
+        first. Columns are only ever added at the end or dropped, which is all
+        `ALTER TABLE` can do; anything more structural would need a real
+        migration step.
         """
         columns = {row["name"] for row in self._db.execute("PRAGMA table_info(blocks)")}
         for name, ddl in ADDED_COLUMNS:
             if name not in columns:
                 self._db.execute(f"ALTER TABLE blocks ADD COLUMN {name} {ddl}")
+        for name in DROPPED_COLUMNS:
+            if name in columns:
+                # the freed pages are truncated by auto_vacuum, so the file
+                # shrinks on the commit at the end of `__init__`
+                self._db.execute(f"ALTER TABLE blocks DROP COLUMN {name}")
 
     def _claim_file(self) -> Any:
         if fcntl is None:
@@ -211,7 +223,6 @@ class HHStore:
             int(block.verbose),
             json.dumps(sorted(t.name for t in block.tools.values() if not t.is_local)),
             json.dumps(self._encode_local_tools(block), ensure_ascii=False),
-            json.dumps(block.pipe_traces, ensure_ascii=False, default=str),
         )
         assignments = ", ".join(
             f"{name.strip()} = excluded.{name.strip()}"
@@ -270,17 +281,8 @@ class HHStore:
             except ValueError as exc:
                 warnings.append(f"{row['id']}: messages unreadable ({exc})")
                 block.messages = []
-            try:
-                traces = json.loads(row["pipe_traces"])
-                block.pipe_traces = traces if isinstance(traces, list) else []
-                if not isinstance(traces, list):
-                    warnings.append(
-                        f"{row['id']}: pipe traces were not a list "
-                        f"({type(traces).__name__})"
-                    )
-            except ValueError as exc:
-                warnings.append(f"{row['id']}: pipe traces unreadable ({exc})")
-                block.pipe_traces = []
+            # a block's pipe traces are never restored: they are inspection
+            # data, held in memory by the process that ran the turn
             deltas, dropped = self._decode_deltas(row["state_deltas"])
             if dropped is not None:
                 warnings.append(f"{row['id']}: state unreadable ({dropped})")

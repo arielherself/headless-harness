@@ -99,12 +99,13 @@ of names plus the last result:
 wrote /workspace/photo.jpg (184320 bytes)
 ```
 
-The intermediate arguments and results are recorded on the block (`get_context`
+The intermediate arguments and results are kept in memory (`get_context`
 returns them as `pipe_traces`) and reported through `pipe_step_started` /
-`pipe_step_finished` events, but they are never sent to the provider — which is
-the whole point, since that is where a base64 file or a megabyte of HTML would
-otherwise cost tokens. Long values are stored bounded (a prefix, the true length
-and a `sha256` prefix), so inspecting a pipe never bloats the database either.
+`pipe_step_finished` events, but they are never sent to the provider and never
+written to the database — which is the whole point, since that is where a base64
+file or a megabyte of HTML would otherwise cost tokens. Long values are bounded
+(a prefix, the true length and a `sha256` prefix), and the traces live only as
+long as the process does: a pipe exists precisely so its middle need not be kept.
 
 What a piping hook needs to know:
 

@@ -36,6 +36,22 @@ PIPE_VALUE_MAX_DEPTH = 6
 # choice to the provider.
 DEFAULT_MAX_TOKENS = 393216
 
+# The default model's advertised context window, in tokens. A request's input
+# and its output share it, so `max_tokens` comes out of it first. A block may
+# override it, and `0` truncates nothing at all.
+DEFAULT_CONTEXT_WINDOW = 1_000_000
+
+# No tokenizer is available here, so a request is sized from the characters it
+# carries. Mixed English/CJK text runs at roughly three characters per token,
+# and every estimate rounds up: overestimating trims a little history early,
+# while underestimating sends a request the provider will refuse.
+CHARS_PER_TOKEN = 3
+# Beyond its text, a message costs a few tokens of role and framing.
+MESSAGE_TOKENS = 4
+# An image part is charged a flat cost rather than its URL's length: the URL is
+# not text the tokenizer sees, and a data: URI would dwarf everything else.
+IMAGE_TOKENS = 1024
+
 # A hook receiving one event dict per thing that happens during a turn.
 EventHook = Callable[[dict[str, Any]], None]
 
@@ -190,6 +206,43 @@ def content_with_images(text: str, parts: Iterable[dict[str, Any]]) -> Any:
     if not parts:
         return text
     return ([{"type": "text", "text": text}] if text else []) + parts
+
+
+def _message_chars(message: Mapping[str, Any]) -> int:
+    """Characters of a message that reach the model's tokenizer.
+
+    A message's images contribute nothing here: their URLs are not text the
+    tokenizer sees, so `estimate_tokens` charges them a flat cost instead.
+    """
+    chars = len(message_text(message.get("content")))
+    chars += len(message.get("tool_call_id") or "")
+    for call in message.get("tool_calls") or ():
+        function = call.get("function") or {}
+        chars += len(function.get("name") or "")
+        chars += len(function.get("arguments") or "")
+    return chars
+
+
+def estimate_tokens(
+    messages: Iterable[dict[str, Any]],
+    tools: Iterable[dict[str, Any]] = (),
+) -> int:
+    """A conservative token estimate for a request's messages and tool schemas.
+
+    There is no tokenizer to count with, so the estimate is scaled from
+    characters and rounded up (see `CHARS_PER_TOKEN`), with a fixed cost per
+    message and per image. It exists to keep the *oldest* history out of a
+    request before the window does; being a little high only trims early.
+    """
+    messages, tools = list(messages), list(tools)
+    chars = sum(_message_chars(message) for message in messages)
+    chars += sum(len(json.dumps(tool, ensure_ascii=False)) for tool in tools)
+    images = sum(message_image_count(m.get("content")) for m in messages)
+    return (
+        math.ceil(chars / CHARS_PER_TOKEN)
+        + MESSAGE_TOKENS * (len(messages) + len(tools))
+        + IMAGE_TOKENS * images
+    )
 
 
 def _parse_arguments(name: str, raw_arguments: Any) -> tuple[Any, str | None]:
@@ -490,9 +543,9 @@ class HHAgent:
 
     A block owns exactly one user prompt plus everything the model produced in
     reply to it. Blocks are linked through `parent`, so the conversation is a
-    singly linked list and the context sent to the provider is `context()`,
-    rebuilt by walking to the root. Forking stores a prompt and a pointer and
-    copies nothing else.
+    singly linked list and a request's context is `request_context()`, rebuilt
+    by walking to the root and dropping the oldest blocks once `context_window`
+    is reached. Forking stores a prompt and a pointer and copies nothing else.
 
     Tool state has the same shape: a block keeps only the deltas its own turn
     committed, under `state_deltas` keyed by state namespace, and a tool's live
@@ -532,6 +585,9 @@ class HHAgent:
     local_timeout: float
     # output-token cap sent with every turn request; 0 sends no cap
     max_tokens: int
+    # the model's context window, in tokens, shared by input and output; the
+    # oldest blocks are dropped once a request would exceed it, and 0 drops none
+    context_window: int
     # model for failure summaries; empty means this block's own model
     summary_model: str
     include_usage: bool
@@ -560,6 +616,7 @@ class HHAgent:
         timeout: float = DEFAULT_TIMEOUT,
         local_timeout: float = DEFAULT_LOCAL_TIMEOUT,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
         summary_model: str = "",
         include_usage: bool = True,
         verbose: bool = False,
@@ -579,7 +636,10 @@ class HHAgent:
         provider for token accounting on the final chunk. `max_tokens` caps how
         many tokens one turn request may produce; it defaults to the default
         model's own maximum, and `0` leaves the cap to the provider. The
-        failure-summary request is separate and uncapped.
+        failure-summary request is separate and uncapped. `context_window` is
+        the model's context window in tokens, which input and output share: the
+        oldest blocks are dropped whole once a request would reach it, and `0`
+        keeps the whole chain.
         """
         self = cls._blank()
         self.id = id or new_id()
@@ -590,6 +650,7 @@ class HHAgent:
         self.timeout = timeout
         self.local_timeout = local_timeout
         self.max_tokens = max_tokens
+        self.context_window = context_window
         self.summary_model = summary_model
         self.include_usage = include_usage
         self.verbose = verbose
@@ -617,6 +678,8 @@ class HHAgent:
         self._live_states = {}
         self._state_bases = {}
         self.local_timeout = DEFAULT_LOCAL_TIMEOUT
+        # `root` sets the real value; a blank block is never sent a request
+        self.context_window = DEFAULT_CONTEXT_WINDOW
         self._pending = {}
         self._called = []
         return self
@@ -664,6 +727,7 @@ class HHAgent:
         child.timeout = self.timeout
         child.local_timeout = self.local_timeout
         child.max_tokens = self.max_tokens
+        child.context_window = self.context_window
         child.summary_model = self.summary_model
         child.include_usage = self.include_usage
         child.verbose = self.verbose
@@ -705,11 +769,76 @@ class HHAgent:
         """Every message of the chain, oldest first.
 
         Rebuilt on demand by walking to the root, so no block stores a copy of
-        anything its ancestors already hold.
+        anything its ancestors already hold. This is the chain whole, for
+        reporting; what a request carries is `request_context()`, which drops
+        the oldest blocks once `context_window` is reached.
         """
-        # TODO(context-window): the whole lineage goes out on every request, so
-        # this grows without bound as a chain deepens. See TODO.md.
         return [message for node in self.lineage() for message in node.messages]
+
+    def context_budget(self) -> int | None:
+        """How many tokens one request may spend on messages; None if unbounded.
+
+        The window covers a request's input and its output together, so the
+        block's own output cap is reserved before any message gets a token;
+        `max_tokens=0` caps nothing and so reserves nothing. `context_window=0`
+        means no budget at all.
+        """
+        if self.context_window <= 0:
+            return None
+        reserved = self.max_tokens if self.max_tokens > 0 else 0
+        return max(self.context_window - reserved, 0)
+
+    def _plan_context(self) -> tuple[list[Self], dict[str, Any]]:
+        """Which blocks a request may carry, and what carrying them costs.
+
+        The chain is walked from this block back to the root and whole blocks
+        are taken until the budget is spent, so the newest survive and the
+        oldest are dropped. Cutting only between blocks is what keeps an
+        assistant message's tool calls together with the tool messages that
+        answer them, whatever the budget. This block is always taken, budget or
+        not — dropping it would drop the question the turn exists to ask — and a
+        block holding no messages never counts as dropped, since it costs a
+        request nothing.
+        """
+        lineage = self.lineage()
+        budget = self.context_budget()
+        tools_tokens = estimate_tokens((), self.tool_schemas())
+        kept: list[Self] = []
+        used = 0
+        for node in reversed(lineage):
+            cost = estimate_tokens(node.messages)
+            if (
+                budget is not None
+                and kept
+                and cost
+                and used + cost > budget - tools_tokens
+            ):
+                break
+            kept.append(node)
+            used += cost
+        kept.reverse()
+        # blocks above the cut that carry no messages are not "dropped": they
+        # contribute nothing to a request either way
+        stranded = lineage[: len(lineage) - len(kept)]
+        dropped = [node for node in stranded if node.messages]
+        return kept, {
+            "context_window": self.context_window,
+            "budget_tokens": budget,
+            "estimated_tokens": used + tools_tokens,
+            "kept_blocks": len(kept),
+            "dropped_blocks": len(dropped),
+            "dropped_messages": sum(len(node.messages) for node in dropped),
+        }
+
+    def request_context(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """The messages a request from this block would carry, and a report.
+
+        Planned fresh from the chain as it stands. A running turn does not use
+        this: `stream` plans once and sends the same blocks in every round of
+        the turn, so the context cannot shift under the model mid-turn.
+        """
+        kept, report = self._plan_context()
+        return [message for node in kept for message in node.messages], report
 
     def state_namespaces(self) -> list[str]:
         """Namespace of every state delta this chain has committed."""
@@ -1373,6 +1502,9 @@ class HHAgent:
                 raise HHAgentError(f"agent {self.id} is a root; fork from it first")
             if not self.dirty:
                 raise HHAgentError(f"agent {self.id} has already finished its turn")
+            # planned once, for the whole turn: the rounds below add messages,
+            # and a cut recomputed per round would move under the model mid-turn
+            kept, plan = self._plan_context()
             self._emit(
                 hook,
                 "turn_started",
@@ -1384,16 +1516,20 @@ class HHAgent:
                 model=self.model,
                 tools=sorted(self.tools),
                 context_len=len(self.context()),
+                context_window=self.context_window,
+                budget_tokens=plan["budget_tokens"],
                 include_usage=self.include_usage,
                 verbose=self.verbose,
                 max_tokens=self.max_tokens,
             )
             # already in `messages` since fork; only announce it here
             self._announce(hook, self.messages[0], "fork")
+            if plan["dropped_blocks"]:
+                self._emit(hook, "context_truncated", **plan)
             for round_no in range(1, MAX_TOOL_ROUNDS + 1):
                 turn = _Turn()
                 try:
-                    yield from self._stream_turn(turn, hook, round_no)
+                    yield from self._stream_turn(turn, hook, round_no, kept, plan)
                 finally:
                     # captured even when the round fails mid-stream, so a failed
                     # turn still reports what the model had said so far
@@ -1497,12 +1633,24 @@ class HHAgent:
         )
 
     def _stream_turn(
-        self, turn: _Turn, hook: EventHook | None, round_no: int
+        self,
+        turn: _Turn,
+        hook: EventHook | None,
+        round_no: int,
+        kept: list[Self],
+        plan: dict[str, Any],
     ) -> Iterator[str]:
-        """Run one streamed /v1/chat/completions request into `turn`."""
+        """Run one streamed /v1/chat/completions request into `turn`.
+
+        `kept` and `plan` are the plan `stream` made for this turn: the blocks,
+        this one included, whose messages the request may carry, and its report.
+        The plan is deliberately not recomputed per round, so the model never
+        sees its context shrink between the rounds of one turn.
+        """
         started = time.monotonic()
         schemas = self.tool_schemas()
-        messages = self.context()
+        messages = [message for node in kept for message in node.messages]
+        context_len = len(self.context())
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -1527,6 +1675,10 @@ class HHAgent:
             timeout=self.timeout,
             request_bytes=len(body),
             messages=len(messages),
+            context_len=context_len,
+            dropped_blocks=plan["dropped_blocks"],
+            dropped_messages=context_len - len(messages),
+            budget_tokens=plan["budget_tokens"],
             tools=len(schemas),
             depth=self.depth,
             include_usage=self.include_usage,

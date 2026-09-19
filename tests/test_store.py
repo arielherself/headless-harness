@@ -63,6 +63,7 @@ def build(agent_id, parent=None, **fields):
     block.verbose = fields.pop("verbose", False)
     block.timeout = fields.pop("timeout", 5.0)
     block.max_tokens = fields.pop("max_tokens", agent.DEFAULT_MAX_TOKENS)
+    block.context_window = fields.pop("context_window", agent.DEFAULT_CONTEXT_WINDOW)
     block.model = fields.pop("model", "test-model")
     block.local_timeout = fields.pop("local_timeout", agent.DEFAULT_LOCAL_TIMEOUT)
     if fields:
@@ -129,8 +130,8 @@ class ConstructionTests(StoreTestCase):
         for expected in (
             "id", "parent_id", "prompt", "messages", "state_deltas", "text",
             "error", "outcome", "dirty", "created_at", "endpoint", "model",
-            "timeout", "max_tokens", "summary_model", "include_usage", "verbose",
-            "tool_names", "local_tools",
+            "timeout", "max_tokens", "context_window", "summary_model",
+            "include_usage", "verbose", "tool_names", "local_tools",
         ):
             self.assertIn(expected, columns)
         # pipe traces are deliberately not stored, so the column does not exist
@@ -177,6 +178,7 @@ class ConstructionTests(StoreTestCase):
         self.assertIn("outcome", columns)
         self.assertIn("summary_model", columns)
         self.assertIn("max_tokens", columns)
+        self.assertIn("context_window", columns)
 
         blocks, warnings = opened.load("restored-key")
         self.assertEqual(warnings, [])
@@ -190,6 +192,9 @@ class ConstructionTests(StoreTestCase):
         self.assertIsNone(block.outcome)
         self.assertEqual(block.summary_model, "")
         self.assertEqual(block.max_tokens, agent.DEFAULT_MAX_TOKENS)
+        # a row written before the window existed keeps the default window rather
+        # than reverting to an untruncated request
+        self.assertEqual(block.context_window, agent.DEFAULT_CONTEXT_WINDOW)
         self.assertEqual(block.merged_state("mem"), {"k": "v"})
         # traces are never restored: a loaded block starts with none
         self.assertEqual(block.pipe_traces, [])
@@ -273,6 +278,7 @@ class SaveLoadTests(StoreTestCase):
             model="other-model",
             timeout=12.5,
             max_tokens=1234,
+            context_window=2345,
             tools=[tools.ToolEntry("remember", "d", [])],
         )
         store = self.open_store(tools=[tools.ToolEntry("remember", "d", [])])
@@ -295,6 +301,7 @@ class SaveLoadTests(StoreTestCase):
         self.assertEqual(loaded.model, "other-model")
         self.assertEqual(loaded.timeout, 12.5)
         self.assertEqual(loaded.max_tokens, 1234)
+        self.assertEqual(loaded.context_window, 2345)
         self.assertEqual(loaded.summary_model, "summariser")
         self.assertFalse(loaded.include_usage)
         self.assertTrue(loaded.verbose)
@@ -328,6 +335,7 @@ class SaveLoadTests(StoreTestCase):
         block.model = "another-model"
         block.timeout = 3.5
         block.max_tokens = 4321
+        block.context_window = 5432
         block.summary_model = "summariser"
         block.include_usage = False
         block.verbose = True
@@ -355,6 +363,7 @@ class SaveLoadTests(StoreTestCase):
         self.assertEqual(block.model, "another-model")
         self.assertEqual(block.timeout, 3.5)
         self.assertEqual(block.max_tokens, 4321)
+        self.assertEqual(block.context_window, 5432)
         self.assertEqual(block.summary_model, "summariser")
         self.assertFalse(block.include_usage)
         self.assertTrue(block.verbose)

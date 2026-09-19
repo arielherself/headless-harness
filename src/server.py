@@ -13,10 +13,10 @@ earlier block again; the blocks beyond it stay untouched.
 
 Commands
     create_agent   {id?, endpoint?, key?, model?, tools?, timeout?,
-                    max_tokens?, include_usage?,
+                    max_tokens?, context_window?, include_usage?,
                     verbose?}                          makes a root block
     fork           {id, prompt, images?, new_id?, model?, tools?, timeout?,
-                    max_tokens?, include_usage?,
+                    max_tokens?, context_window?, include_usage?,
                     verbose?}                          appends a block
     run            {id}                                executes a block's turn
     cancel         {id}                                stop a running turn
@@ -40,7 +40,7 @@ Events
     content_delta, reasoning_delta, sse_chunk (verbose), sse_unparsed, usage,
     assistant_message, history_appended, tool_call_requested,
     tool_call_started, tool_call_finished, pipe_step_started,
-    pipe_step_finished, state_loaded, state_delta,
+    pipe_step_finished, context_truncated, state_loaded, state_delta,
     state_discarded, local_tool_called, local_tool_rollback,
     local_tool_resolved, local_tool_unresolved, rollback_started,
     rollback_finished, rollback_unavailable, failure_summary_started,
@@ -106,6 +106,7 @@ import traceback
 from typing import Any, cast
 
 from agent import (
+    DEFAULT_CONTEXT_WINDOW,
     DEFAULT_LOCAL_TIMEOUT,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
@@ -148,6 +149,8 @@ COMMANDS: list[dict[str, Any]] = [
             "timeout": "optional read timeout in seconds",
             "local_timeout": "optional seconds to wait for a local tool answer",
             "max_tokens": "optional output-token cap; 0 leaves it to the provider",
+            "context_window": "optional context window in tokens; the oldest "
+            "blocks are dropped once it is reached, and 0 keeps the whole chain",
             "summary_model": "optional model for failure summaries; defaults to the block's own",
             "include_usage": "optional bool, ask for token accounting",
             "verbose": "optional bool, also emit raw sse_chunk events",
@@ -170,6 +173,7 @@ COMMANDS: list[dict[str, Any]] = [
             "timeout": "optional override inherited from the parent",
             "local_timeout": "optional override inherited from the parent",
             "max_tokens": "optional override inherited from the parent",
+            "context_window": "optional override inherited from the parent",
             "summary_model": "optional override inherited from the parent",
             "include_usage": "optional override inherited from the parent",
             "verbose": "optional override inherited from the parent",
@@ -240,12 +244,12 @@ COMMANDS: list[dict[str, Any]] = [
 
 # Settings a fork may override on the block it creates.
 INHERITED = (
-    "model", "timeout", "local_timeout", "max_tokens", "summary_model",
-    "include_usage", "verbose",
+    "model", "timeout", "local_timeout", "max_tokens", "context_window",
+    "summary_model", "include_usage", "verbose",
 )
 BOOL_FIELDS = ("include_usage", "verbose")
 FLOAT_FIELDS = ("timeout", "local_timeout")
-INT_FIELDS = ("max_tokens",)
+INT_FIELDS = ("max_tokens", "context_window")
 
 
 class HHTcpError(Exception):
@@ -515,11 +519,17 @@ class HHServer(socketserver.ThreadingTCPServer):
             local_timeout=as_timeout(
                 command.get("local_timeout") or DEFAULT_LOCAL_TIMEOUT, "local_timeout"
             ),
-            max_tokens=as_max_tokens(
+            max_tokens=as_token_count(
                 DEFAULT_MAX_TOKENS
                 if command.get("max_tokens") is None
                 else command["max_tokens"],
                 "max_tokens",
+            ),
+            context_window=as_token_count(
+                DEFAULT_CONTEXT_WINDOW
+                if command.get("context_window") is None
+                else command["context_window"],
+                "context_window",
             ),
             summary_model=command.get("summary_model") or "",
             include_usage=bool(command.get("include_usage", True)),
@@ -548,6 +558,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             include_usage=block.include_usage,
             verbose=block.verbose,
             max_tokens=block.max_tokens,
+            context_window=block.context_window,
             tools=sorted(block.tools),
             local_tools=sorted(t.name for t in block.tools.values() if t.is_local),
             tool_schemas=block.tool_schemas(),
@@ -598,6 +609,7 @@ class HHServer(socketserver.ThreadingTCPServer):
             include_usage=child.include_usage,
             verbose=child.verbose,
             max_tokens=child.max_tokens,
+            context_window=child.context_window,
             tools=sorted(child.tools),
             local_tools=sorted(t.name for t in child.tools.values() if t.is_local),
             state_namespaces=child.state_namespaces(),
@@ -654,6 +666,9 @@ class HHServer(socketserver.ThreadingTCPServer):
         agent_id = require_id(command)
         block = self.block(agent_id)
         context = block.context()
+        # what a request from this block would carry, as opposed to the whole
+        # chain above: the plan is the same one `stream` would make for a turn
+        sent, plan = block.request_context()
         conn.send(
             "context",
             rid=rid,
@@ -662,6 +677,10 @@ class HHServer(socketserver.ThreadingTCPServer):
             path=block.path(),
             context=context,
             context_len=len(context),
+            request_len=len(sent),
+            context_window=block.context_window,
+            budget_tokens=plan["budget_tokens"],
+            dropped_blocks=plan["dropped_blocks"],
             local_len=len(block.messages),
             messages=block.messages,
             # what the block's own tool pipes did, step by step, with their
@@ -1021,6 +1040,8 @@ class HHServer(socketserver.ThreadingTCPServer):
             "include_usage": block.include_usage,
             "verbose": block.verbose,
             "max_tokens": block.max_tokens,
+            "context_window": block.context_window,
+            "budget_tokens": block.context_budget(),
             "created_at": block.created_at,
             "age_ms": round((time.time() - block.created_at) * 1000, 3),
         }
@@ -1069,7 +1090,7 @@ def apply_overrides(block: HHAgent, command: dict[str, Any]) -> None:
         elif name in FLOAT_FIELDS:
             setattr(block, name, as_timeout(value, name))
         elif name in INT_FIELDS:
-            setattr(block, name, as_max_tokens(value, name))
+            setattr(block, name, as_token_count(value, name))
         else:
             if not isinstance(value, str) or not value:
                 raise HHTcpError(
@@ -1117,17 +1138,21 @@ def as_timeout(value: Any, field: str) -> float:
     return timeout
 
 
-def as_max_tokens(value: Any, field: str) -> int:
-    """Coerce an output-token cap; `0` means no cap and is allowed."""
+def as_token_count(value: Any, field: str) -> int:
+    """Coerce a token count such as `max_tokens` or `context_window`.
+
+    `0` is allowed and always means a deliberate absence — no output cap, or no
+    truncation — never an accidental one.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise HHTcpError("bad_field", f"{field!r} must be an integer")
     try:
-        cap = int(value)
+        count = int(value)
     except ValueError as exc:
         raise HHTcpError("bad_field", f"{field!r} must be an integer: {exc}") from exc
-    if cap < 0:
+    if count < 0:
         raise HHTcpError("bad_field", f"{field!r} must not be negative")
-    return cap
+    return count
 
 
 def build_tools(

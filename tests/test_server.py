@@ -368,6 +368,7 @@ class CreateAgentTests(ServerTestCase):
         self.assertEqual(created["timeout"], agent.DEFAULT_TIMEOUT)
         self.assertEqual(created["summary_model"], "")
         self.assertEqual(created["max_tokens"], agent.DEFAULT_MAX_TOKENS)
+        self.assertEqual(created["context_window"], agent.DEFAULT_CONTEXT_WINDOW)
         self.assertTrue(created["include_usage"])
         self.assertFalse(created["verbose"])
         self.assertEqual(created["local_tools"], [])
@@ -563,6 +564,19 @@ class CreateAgentTests(ServerTestCase):
             client.send("create_agent", rid=rid, id=f"bad{index}", max_tokens=bad)
             client.wait_error(rid, code="bad_field")
 
+    def test_context_window_is_coerced_and_may_be_zero(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        created = self.create(client, "root", context_window="4096")
+        self.assertEqual(created["context_window"], 4096)
+        # 0 is meaningful here: the whole chain goes out, untruncated
+        created = self.create(client, "root0", context_window=0)
+        self.assertEqual(created["context_window"], 0)
+        for index, bad in enumerate((-1, 1.5, "soon", True)):
+            rid = f"w{index}"
+            client.send("create_agent", rid=rid, id=f"bad{index}", context_window=bad)
+            client.wait_error(rid, code="bad_field")
+
     def test_a_summary_model_can_be_set(self):
         fixture = self.start_server()
         created = self.create(fixture.client(), "root", summary_model="cheap")
@@ -596,6 +610,7 @@ class ForkTests(ServerTestCase):
         self.assertEqual(forked["model"], TEST_MODEL)
         self.assertEqual(forked["timeout"], agent.DEFAULT_TIMEOUT)
         self.assertEqual(forked["max_tokens"], agent.DEFAULT_MAX_TOKENS)
+        self.assertEqual(forked["context_window"], agent.DEFAULT_CONTEXT_WINDOW)
         self.assertTrue(forked["include_usage"])
         self.assertFalse(forked["verbose"])
         self.assertEqual(
@@ -759,6 +774,7 @@ class ForkTests(ServerTestCase):
             timeout=9,
             local_timeout="2.5",
             max_tokens=8,
+            context_window=1000,
             include_usage=False,
             verbose=True,
             summary_model="summariser",
@@ -767,6 +783,7 @@ class ForkTests(ServerTestCase):
         self.assertEqual(forked["model"], "other")
         self.assertEqual(forked["timeout"], 9.0)
         self.assertEqual(forked["max_tokens"], 8)
+        self.assertEqual(forked["context_window"], 1000)
         self.assertFalse(forked["include_usage"])
         self.assertTrue(forked["verbose"])
         block = self.fetch_block(fixture, "a1")
@@ -787,6 +804,9 @@ class ForkTests(ServerTestCase):
             ({"max_tokens": -1}, "bad_field"),
             ({"max_tokens": 1.5}, "bad_field"),
             ({"max_tokens": True}, "bad_field"),
+            ({"context_window": -1}, "bad_field"),
+            ({"context_window": 1.5}, "bad_field"),
+            ({"context_window": True}, "bad_field"),
             ({"summary_model": ""}, "bad_field"),
             ({"tools": ["nope"]}, "unknown_tool"),
             ({"local_tools": "nope"}, "bad_tools"),
@@ -1092,6 +1112,13 @@ class ContextAndStateTests(ServerTestCase):
         self.assertEqual(event["path"], ["root", "a1", "a2"])
         self.assertEqual(event["context_len"], 4)
         self.assertEqual(event["local_len"], 2)
+        self.assertEqual(event["request_len"], 4)
+        self.assertEqual(event["context_window"], agent.DEFAULT_CONTEXT_WINDOW)
+        self.assertEqual(
+            event["budget_tokens"],
+            agent.DEFAULT_CONTEXT_WINDOW - agent.DEFAULT_MAX_TOKENS,
+        )
+        self.assertEqual(event["dropped_blocks"], 0)
         self.assertEqual(
             [message["content"] for message in event["context"]],
             ["first", "answer one", "second", "answer two"],
@@ -1104,6 +1131,26 @@ class ContextAndStateTests(ServerTestCase):
             ],
         )
         self.assertEqual(event["context"][0], {"role": "user", "content": "first"})
+
+    def test_get_context_reports_what_a_request_would_carry(self):
+        fixture = self.start_server()
+        client = fixture.client()
+        self.create(client, "root", tools=[], max_tokens=0, context_window=1)
+        self.fork(client, "root", "first", new_id="a1")
+        self.provider.text("answer one")
+        self.run_block(client, "a1")
+        self.fork(client, "a1", "second", new_id="a2")
+
+        client.command("get_context", id="a2")
+        event = client.wait_event("context")
+        # the whole chain is still reported for inspection...
+        self.assertEqual(event["context_len"], 3)
+        self.assertEqual(event["path"], ["root", "a1", "a2"])
+        # ...but a request would carry only the newest block
+        self.assertEqual(event["request_len"], 1)
+        self.assertEqual(event["dropped_blocks"], 1)
+        self.assertEqual(event["context_window"], 1)
+        self.assertEqual(event["budget_tokens"], 1)
 
     def test_get_state_returns_every_touched_namespace(self):
         fixture = self.start_server()
@@ -1762,6 +1809,11 @@ class RegistryTests(ServerTestCase):
         self.assertEqual(root["state_namespaces"], [])
         self.assertEqual(root["waiting_on"], [])
         self.assertEqual(root["max_tokens"], agent.DEFAULT_MAX_TOKENS)
+        self.assertEqual(root["context_window"], agent.DEFAULT_CONTEXT_WINDOW)
+        self.assertEqual(
+            root["budget_tokens"],
+            agent.DEFAULT_CONTEXT_WINDOW - agent.DEFAULT_MAX_TOKENS,
+        )
         self.assertTrue(root["include_usage"])
         self.assertFalse(root["verbose"])
         self.assertGreater(root["created_at"], 0)

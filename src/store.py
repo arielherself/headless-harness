@@ -6,7 +6,8 @@ restart can rebuild the same chains.
 Per block it stores identity and linkage (`id`, `parent_id`), the conversation
 the block owns (`prompt`, `messages`, `text`, `error`), its tool state deltas,
 its lifecycle flags (`dirty`, `created_at`) and the settings that shape a turn
-(`endpoint`, `model`, `timeout`, `max_tokens`, `include_usage`, `verbose`). Tools
+(`endpoint`, `model`, `timeout`, `max_tokens`, `context_window`, `include_usage`,
+`verbose`). Tools
 are stored by *name* and resolved against the catalogue on load, because a hook
 is a function and cannot be persisted. The API key is never written, so blocks
 restored from disk inherit whatever key the server was started with. The traces
@@ -39,7 +40,7 @@ try:  # POSIX only; without it the store still works, just without the lock
 except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
 
-from agent import DEFAULT_MAX_TOKENS, HHAgent, StateDelta
+from agent import DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, HHAgent, StateDelta
 from tools import ToolEntry, ToolParam, builtin_tools
 
 SCHEMA = """
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     model         TEXT NOT NULL,
     timeout       REAL NOT NULL,
     max_tokens    INTEGER NOT NULL,
+    context_window INTEGER NOT NULL,
     include_usage INTEGER NOT NULL,
     verbose       INTEGER NOT NULL,
     tool_names    TEXT NOT NULL,
@@ -70,15 +72,15 @@ CREATE INDEX IF NOT EXISTS blocks_created ON blocks (created_at);
 
 COLUMNS = (
     "id, parent_id, prompt, messages, state_deltas, text, error, outcome, dirty, "
-    "created_at, endpoint, model, timeout, max_tokens, summary_model, "
-    "include_usage, verbose, tool_names, local_tools"
+    "created_at, endpoint, model, timeout, max_tokens, context_window, "
+    "summary_model, include_usage, verbose, tool_names, local_tools"
 )
 
 # Columns refreshed when a block that already has a row changes.
 UPDATABLE = (
     "prompt, messages, state_deltas, text, error, outcome, dirty, created_at, "
-    "endpoint, model, timeout, max_tokens, summary_model, include_usage, verbose, "
-    "tool_names, local_tools"
+    "endpoint, model, timeout, max_tokens, context_window, summary_model, "
+    "include_usage, verbose, tool_names, local_tools"
 )
 
 # Columns added after the first release. SQLite has no `ADD COLUMN IF NOT
@@ -90,6 +92,9 @@ ADDED_COLUMNS = (
     # blocks written before the cap existed fall back to the same default a
     # fresh block gets, rather than to no cap at all
     ("max_tokens", f"INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_TOKENS)}"),
+    # same for the window: an older block keeps the default model's window
+    # rather than silently reverting to an untruncated request
+    ("context_window", f"INTEGER NOT NULL DEFAULT {int(DEFAULT_CONTEXT_WINDOW)}"),
 )
 
 # Columns a later version stopped storing. `pipe_traces` held a tool pipe's
@@ -218,6 +223,7 @@ class HHStore:
             block.model,
             float(block.timeout),
             int(block.max_tokens),
+            int(block.context_window),
             block.summary_model,
             int(block.include_usage),
             int(block.verbose),
@@ -271,6 +277,7 @@ class HHStore:
                 tools=[self.tools[name] for name in names if name in self.tools] + local,
                 timeout=row["timeout"],
                 max_tokens=row["max_tokens"],
+                context_window=row["context_window"],
                 summary_model=row["summary_model"],
                 include_usage=bool(row["include_usage"]),
                 verbose=bool(row["verbose"]),

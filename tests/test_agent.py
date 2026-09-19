@@ -324,6 +324,7 @@ class RootAndForkTests(HHTestCase):
         self.assertEqual(root.timeout, agent.DEFAULT_TIMEOUT)
         self.assertEqual(root.local_timeout, agent.DEFAULT_LOCAL_TIMEOUT)
         self.assertEqual(root.max_tokens, agent.DEFAULT_MAX_TOKENS)
+        self.assertEqual(root.context_window, agent.DEFAULT_CONTEXT_WINDOW)
         self.assertEqual(root.summary_model, "")
         self.assertTrue(root.include_usage)
         self.assertFalse(root.verbose)
@@ -471,6 +472,7 @@ class RootAndForkTests(HHTestCase):
             timeout=7.0,
             local_timeout=3.0,
             max_tokens=8,
+            context_window=1234,
             summary_model="summariser",
             include_usage=False,
             verbose=True,
@@ -484,6 +486,7 @@ class RootAndForkTests(HHTestCase):
         self.assertEqual(child.timeout, 7.0)
         self.assertEqual(child.local_timeout, 3.0)
         self.assertEqual(child.max_tokens, 8)
+        self.assertEqual(child.context_window, 1234)
         self.assertEqual(child.summary_model, "summariser")
         self.assertFalse(child.include_usage)
         self.assertTrue(child.verbose)
@@ -1003,6 +1006,208 @@ class TurnLifecycleTests(HHTestCase):
 
 
 # --- tool rounds ---------------------------------------------------------
+
+
+class ContextWindowTests(HHTestCase):
+    """A request carries the newest whole blocks that fit the block's window.
+
+    Most chains here use `tools=[]` and `max_tokens=0`, so the budget is exactly
+    `context_window` and the sizes the tests compute are the sizes the harness
+    computes.
+    """
+
+    def _turn(self, block, text="ok"):
+        """Run `block`'s turn with a scripted reply, returning the events."""
+        self.provider.text(text)
+        events = []
+        self.run_turn(block, on_event=events.append)
+        return events
+
+    @staticmethod
+    def _calls_are_paired(messages):
+        """Every assistant tool call has its tool answer here, and vice versa."""
+        calls, answers = set(), set()
+        for message in messages:
+            for call in message.get("tool_calls") or ():
+                calls.add(call["id"])
+            if message.get("role") == "tool":
+                answers.add(message.get("tool_call_id"))
+        return calls == answers
+
+    def test_estimate_rounds_up_and_charges_images_flat(self):
+        self.assertEqual(agent.estimate_tokens([]), 0)
+        one = [{"role": "user", "content": "abc"}]
+        self.assertEqual(agent.estimate_tokens(one), 1 + agent.MESSAGE_TOKENS)
+        # a data: URI is not text the tokenizer sees, so its length must not
+        # count; the image is charged a flat cost instead
+        huge = "data:image/png;base64," + "A" * 100_000
+        with_image = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": huge}},
+                ],
+            }
+        ]
+        self.assertGreaterEqual(agent.estimate_tokens(with_image), agent.IMAGE_TOKENS)
+        self.assertLess(agent.estimate_tokens(with_image), agent.IMAGE_TOKENS + 100)
+        # the tool schemas go out too, so they count as well
+        self.assertGreater(agent.estimate_tokens((), self.root().tool_schemas()), 0)
+
+    def test_the_oldest_blocks_are_dropped_once_the_window_is_reached(self):
+        root = self.root(tools=[], max_tokens=0)
+        first = root.fork("one")
+        self._turn(first, "a")
+        second = first.fork("two")
+        self._turn(second, "b")
+        third = second.fork("three")
+        third.context_window = agent.estimate_tokens(
+            second.messages
+        ) + agent.estimate_tokens(third.messages)
+
+        events = self._turn(third, "c")
+
+        self.assertEqual(
+            self.provider.last_payload()["messages"],
+            second.messages + [{"role": "user", "content": "three"}],
+        )
+        # the whole chain is still there for reporting
+
+        truncated = pick(events, "context_truncated")[0]
+        self.assertEqual(truncated["dropped_blocks"], 1)
+        self.assertEqual(truncated["dropped_messages"], len(first.messages))
+        self.assertEqual(truncated["kept_blocks"], 2)
+        self.assertEqual(truncated["context_window"], third.context_window)
+        self.assertEqual(truncated["budget_tokens"], third.context_window)
+        self.assertGreater(truncated["estimated_tokens"], 0)
+
+        started = pick(events, "turn_started")[0]
+        self.assertEqual(started["context_len"], 5)
+        self.assertEqual(started["context_window"], third.context_window)
+        self.assertEqual(started["budget_tokens"], third.context_window)
+
+        request = pick(events, "request_started")[0]
+        self.assertEqual(request["messages"], 3)
+        self.assertEqual(request["context_len"], 5)
+        self.assertEqual(request["dropped_blocks"], 1)
+        self.assertEqual(request["dropped_messages"], 2)
+        self.assertEqual(request["budget_tokens"], third.context_window)
+
+    def test_a_block_that_does_not_fit_alone_is_still_sent(self):
+        root = self.root(tools=[], max_tokens=0, context_window=1)
+        block = root.fork("this prompt cannot fit")
+        events = self._turn(block, "ok")
+
+        self.assertEqual(
+            self.provider.last_payload()["messages"],
+            [{"role": "user", "content": "this prompt cannot fit"}],
+        )
+        # nothing was actually dropped: the root holds no messages, and this
+        # block is the question the turn exists to ask
+        self.assertEqual(pick(events, "context_truncated"), [])
+        self.assertEqual(pick(events, "turn_started")[0]["budget_tokens"], 1)
+
+    def test_a_window_of_zero_keeps_the_whole_chain(self):
+        root = self.root(tools=[], max_tokens=0, context_window=0)
+        first = root.fork("one")
+        self._turn(first, "a")
+        second = first.fork("two")
+        events = self._turn(second, "b")
+
+        # the request carried the chain as it stood before this turn's reply
+        self.assertEqual(
+            self.provider.last_payload()["messages"],
+            first.context() + [{"role": "user", "content": "two"}],
+        )
+        self.assertEqual(pick(events, "context_truncated"), [])
+        self.assertIsNone(second.context_budget())
+        started = pick(events, "turn_started")[0]
+        self.assertEqual(started["context_window"], 0)
+        self.assertIsNone(started["budget_tokens"])
+
+    def test_the_output_cap_is_reserved_before_messages(self):
+        root = self.root(tools=[], context_window=100, max_tokens=40)
+        self.assertEqual(root.context_budget(), 60)
+        root.max_tokens = 0
+        self.assertEqual(root.context_budget(), 100)
+        root.max_tokens = 500
+        self.assertEqual(root.context_budget(), 0)
+        root.context_window = 0
+        self.assertIsNone(root.context_budget())
+
+    def test_a_kept_block_brings_its_tool_calls_and_answers_together(self):
+        self.provider.script(
+            Response.tool_call("get_current_time", {}, "c1"),
+            Response.text("clock checked"),
+        )
+        first = self.root().fork("what time is it?")
+        self.run_turn(first)
+        second = first.fork("and now?")
+        self._turn(second, "same as before")
+
+        messages = self.provider.last_payload()["messages"]
+        self.assertIn({"role": "user", "content": "what time is it?"}, messages)
+        self.assertTrue(self._calls_are_paired(messages))
+
+    def test_the_cut_never_falls_inside_a_block(self):
+        self.provider.script(
+            Response.tool_call("get_current_time", {}, "c1"),
+            Response.text("clock checked"),
+        )
+        first = self.root().fork("what time is it?")
+        self.run_turn(first)
+        second = first.fork("and now?")
+        # only this block and its schemas fit: `first` and its whole tool round
+        # go over the window together
+        second.max_tokens = 0
+        second.context_window = agent.estimate_tokens(
+            second.messages, second.tool_schemas()
+        )
+        self._turn(second, "same as before")
+
+        messages = self.provider.last_payload()["messages"]
+        self.assertEqual(messages, [{"role": "user", "content": "and now?"}])
+        self.assertFalse(
+            any(m.get("tool_calls") or m.get("role") == "tool" for m in messages)
+        )
+
+    def test_the_cut_is_frozen_across_the_rounds_of_one_turn(self):
+        first = self.root().fork("one")
+        self._turn(first, "a")
+        second = first.fork("question")
+        schemas = second.tool_schemas()
+        second.max_tokens = 0
+        # the window fits `first` and the prompt exactly, but not the tool round
+        # this turn is about to take
+        second.context_window = (
+            agent.estimate_tokens(first.messages)
+            + agent.estimate_tokens(second.messages)
+            + agent.estimate_tokens((), schemas)
+        )
+
+        self.provider.script(
+            Response.tool_call("get_current_time", {}, "c1"),
+            Response.text("the time is now"),
+        )
+        events = []
+        self.run_turn(second, on_event=events.append)
+
+        payloads = self.provider.payloads()[-2:]
+        self.assertEqual(len(payloads), 2)
+        self.assertIn({"role": "user", "content": "one"}, payloads[0]["messages"])
+        # this round's own messages pushed the request past the window, so a
+        # fresh plan would drop `first` — the turn's frozen plan keeps it
+        self.assertIn({"role": "user", "content": "one"}, payloads[1]["messages"])
+        fresh, report = second.request_context()
+        self.assertNotIn({"role": "user", "content": "one"}, fresh)
+        self.assertEqual(report["dropped_blocks"], 1)
+        self.assertGreater(
+            agent.estimate_tokens(payloads[1]["messages"], schemas),
+            second.context_window,
+        )
+        # the first round fitted, so nothing was reported as dropped then
+        self.assertEqual(pick(events, "context_truncated"), [])
 
 
 class ToolRoundTests(HHTestCase):

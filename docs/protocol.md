@@ -1,7 +1,7 @@
 # Protocol
 
 The server speaks **newline-delimited JSON over TCP**: one JSON object per line,
-in both directions, UTF-8. Default `127.0.0.1:8765`, protocol version `4`.
+in both directions, UTF-8. Default `127.0.0.1:8765`, protocol version `5`.
 
 A line longer than ~268 MiB is rejected with `command_too_large` and the
 connection closes. The cap is sized so that a client can pipe a file into a
@@ -81,13 +81,14 @@ never dirty.
 | `timeout` | optional read timeout in seconds |
 | `local_timeout` | optional seconds to wait for a local tool to be answered (default 120) |
 | `max_tokens` | optional output-token cap for every turn request; defaults to the default model's own maximum (393216), and `0` sends no cap (the failure-summary request is separate and uncapped) |
+| `context_window` | optional context window in tokens, which a request's input and output share; the oldest blocks are dropped whole once a request would reach it, and `0` keeps the whole chain (see [The context window](#the-context-window)) |
 | `summary_model` | optional model for failure summaries; defaults to the block's own |
 | `include_usage` | optional bool; asks the provider for token accounting |
 | `verbose` | optional bool; additionally emits raw `sse_chunk` events |
 
 → `agent_created` (`agent_id`, `parent: null`, `depth: 0`, `dirty`, `model`,
-`endpoint`, `timeout`, `max_tokens`, `include_usage`, `verbose`, `tools`,
-`local_tools`, `tool_schemas`).
+`endpoint`, `timeout`, `max_tokens`, `context_window`, `include_usage`, `verbose`,
+`tools`, `local_tools`, `tool_schemas`).
 
 Errors: `bad_id`, `missing_credentials`, `duplicate_agent`, `unknown_tool`,
 `bad_tools`, `bad_field`.
@@ -103,7 +104,7 @@ endpoint, key, model, tools and options, and **starts dirty**.
 | `prompt` | **required** — non-empty string |
 | `images` | optional — images sent with the prompt (see [Images](#images)) |
 | `new_id` | optional id for the new block; supply it to avoid waiting for the reply |
-| `model` `tools` `local_tools` `timeout` `local_timeout` `max_tokens` `summary_model` `include_usage` `verbose` | optional overrides for the child only |
+| `model` `tools` `local_tools` `timeout` `local_timeout` `max_tokens` `context_window` `summary_model` `include_usage` `verbose` | optional overrides for the child only |
 
 `tools` and `local_tools` are separate axes: supplying either replaces that half
 and carries the other half over, so a fork can add a local tool without losing
@@ -111,8 +112,8 @@ the inherited builtins.
 
 → `agent_forked` (`agent_id`, `parent`, `depth`, `dirty`, `prompt`,
 `prompt_chars`, `image_count`, `path` (ids root → child), `context_len`, `model`,
-`timeout`, `max_tokens`, `include_usage`, `verbose`, `tools`, `local_tools`,
-`state_namespaces`).
+`timeout`, `max_tokens`, `context_window`, `include_usage`, `verbose`, `tools`,
+`local_tools`, `state_namespaces`).
 
 Errors: `bad_id`, `bad_prompt`, `bad_image`, `unknown_agent`, `parent_dirty`,
 `duplicate_agent`, `unknown_tool`, `bad_field`.
@@ -195,8 +196,10 @@ landmine for the next turn.
 |---|---|
 | `id` | **required** |
 
-→ `context` (`depth`, `path`, `context` — the flattened messages that would be
-sent, `context_len`, `local_len` — how many of them this block owns, `messages` —
+→ `context` (`depth`, `path`, `context` — the flattened messages of the whole
+chain, `context_len`, `request_len` — how many of those a request from this
+block would carry, `context_window`, `budget_tokens`, `dropped_blocks` — what
+the plan leaves out, `local_len` — how many of them this block owns, `messages` —
 this block's own list, `pipe_traces` — one record per tool pipe this block's own
 turn ran *in this process*, see [Tool pipes](#tool-pipes); traces are never
 stored, so a block restored from the store reports none).
@@ -243,8 +246,8 @@ Each entry: `agent_id`, `parent`, `depth`, `dirty`, `running`, `outcome`
 `local_len`, `context_len`, `model`, `summary_model`, `tools`, `local_tools`,
 `state_namespaces`, `waiting_on` (local calls this block is parked on),
 `pipe_traces` (how many this block's own turn ran in this process; traces are
-not persisted, so a restart reports none), `max_tokens`, `include_usage`,
-`verbose`, `created_at`, `age_ms`.
+not persisted, so a restart reports none), `max_tokens`, `context_window`,
+`budget_tokens`, `include_usage`, `verbose`, `created_at`, `age_ms`.
 
 ### `destroy_agent`
 
@@ -330,7 +333,8 @@ unreadable row).
 
 | Event | Fields |
 |---|---|
-| `turn_started` | `prompt`, `prompt_chars`, `image_count`, `depth`, `path`, `model`, `tools`, `context_len`, `max_tokens`, `include_usage`, `verbose` |
+| `turn_started` | `prompt`, `prompt_chars`, `image_count`, `depth`, `path`, `model`, `tools`, `context_len`, `context_window`, `budget_tokens`, `max_tokens`, `include_usage`, `verbose` |
+| `context_truncated` | `context_window`, `budget_tokens`, `estimated_tokens`, `kept_blocks`, `dropped_blocks`, `dropped_messages` — emitted once at the start of a turn whose oldest blocks no longer fit |
 | `turn_finished` | `text`, `text_chars`, `rounds`, `tool_calls` (the model's own), `pipe_steps` (calls tools added by piping), `elapsed_ms`, `messages`, `context_len`, `dirty: false` |
 | `turn_failed` | `error`, `error_type`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
 | `turn_cancelled` | `error`, `text` (partial), `elapsed_ms`, `context_len`, `dirty: false` |
@@ -338,11 +342,42 @@ unreadable row).
 A turn is one or more rounds: each round is one request, and a round that
 requests tools is followed by another round until the model answers with text.
 
+#### The context window
+
+A request carries only as much of the chain as `context_window` allows. The
+chain is walked from the block back to the root and whole blocks are taken until
+the budget is spent, so the newest blocks survive and the oldest are **dropped
+whole** — a cut never falls inside a block, which is what keeps an assistant
+message's tool calls together with the tool messages answering them.
+
+- The budget is `context_window - max_tokens`, because a request's input and its
+  output share the window; `max_tokens: 0` reserves nothing, and
+  `context_window: 0` disables truncation, sending the whole chain.
+- The block being run is always carried — dropping it would drop the question —
+  and a block holding no messages (a root) is never counted as dropped.
+- The **tool schemas** are charged against the same budget, since they ride in
+  the same request.
+- Sizes are estimated from characters, because no tokenizer is available, with a
+  fixed cost per message and per image: a `data:` URI's length says nothing
+  about what the model sees.
+- The cut is planned once per turn and reused by every tool round, so the
+  context cannot shift under the model mid-turn. A round's own messages may push
+  the request past the window; the next turn plans afresh.
+
+`context_truncated` reports the plan that dropped something. Every
+`request_started` carries the same `dropped_blocks` / `dropped_messages` counts
+next to `messages` (what went out) and `context_len` (the whole chain), and
+`get_context` reports a block's plan without starting a turn.
+
+The window and its events arrived in protocol `5`: a `4` server ignores
+`context_window` and never emits `context_truncated`, so check
+`session_hello.protocol` before relying on either.
+
 ### Request (`round` is 1-based within the turn)
 
 | Event | Fields |
 |---|---|
-| `request_started` | `round`, `url`, `model`, `timeout`, `request_bytes`, `messages`, `tools`, `depth`, `max_tokens`, `include_usage` |
+| `request_started` | `round`, `url`, `model`, `timeout`, `request_bytes`, `messages`, `context_len`, `dropped_blocks`, `dropped_messages`, `budget_tokens`, `tools`, `depth`, `max_tokens`, `include_usage` |
 | `request_payload` | `round`, `messages` — a per-message summary: `role`, `chars`, `image_count` when the message has images, and `tool_call_id` / `tool_calls` when present |
 | `response_received` | `round`, `status`, `reason`, `content_type`, `elapsed_ms` |
 | `request_finished` | `round`, `status`, `chunks`, `payload_chars`, `finish_reason`, `first_chunk_ms`, `elapsed_ms`, `cancelled` |

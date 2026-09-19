@@ -142,7 +142,7 @@ then choose which tools a block gets:
 | Field | Meaning |
 |---|---|
 | `tool` | the `ToolEntry`, so a shared hook can branch on `tool.name` |
-| `agent` | the running block — `agent.context()` is the conversation, `agent.depth`, `agent.path()`, `agent.id` |
+| `agent` | the running block — `agent.context()` is the chain's messages, `agent.request_context()` the messages the model actually gets (see the context window in [`protocol.md`](protocol.md)), `agent.depth`, `agent.path()`, `agent.id` |
 | `call_id` | the provider's id for this call |
 | `arguments` | the decoded arguments dict |
 | `raw_arguments` | exactly what the model sent, before decoding |

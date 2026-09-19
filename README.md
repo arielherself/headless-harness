@@ -8,7 +8,9 @@ The idea is simple: a message is never appended to a growing transcript. Each
 prompt creates a new **block** holding just that prompt and whatever the model
 produced in reply, linking to its parent. The request context is rebuilt by
 walking to the root, so a block stores only its own delta and nothing is ever
-copied. Forking a block rewinds the conversation — and every tool's memory —
+copied. A request carries only the newest whole blocks that fit the block's
+`context_window`; older blocks are dropped from the request, never from the
+store. Forking a block rewinds the conversation — and every tool's memory —
 to exactly that point, because tool state is stored the same way.
 
 ## Quick start

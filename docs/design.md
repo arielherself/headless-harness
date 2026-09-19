@@ -12,10 +12,12 @@ harness instead makes each prompt its own object:
 - `block.fork(prompt)` creates a child holding that prompt, linked by `parent`.
 - A block owns exactly the messages its own turn produced; nothing else.
 
-`block.context()` (`agent.py`) rebuilds the full request by walking `parent` to
+`block.context()` (`agent.py`) rebuilds the whole chain by walking `parent` to
 the root and concatenating each block's `messages`. The walk is the whole of the
 storage story: a block never copies anything an ancestor already holds, so a
-thousand-turn chain still stores each message once.
+thousand-turn chain still stores each message once. What a *request* carries is
+`request_context()`, the newest whole blocks that fit `context_window`; the
+oldest are dropped from the transport, never from the storage (see §10).
 
 Two consequences fall out of that, and they are the point of the design:
 
@@ -29,7 +31,9 @@ Two consequences fall out of that, and they are the point of the design:
 
 The context is rebuilt on every request rather than cached. It costs O(depth) of
 pointer chasing, and it removes an entire class of bugs: there is no cache to
-invalidate when a block's messages change.
+invalidate when a block's messages change. The window's cut is the one thing
+planned ahead of time — once per turn, so it cannot move between a turn's tool
+rounds.
 
 ## 2. A block runs once: the dirty bit
 
@@ -380,9 +384,13 @@ and evicts in the middle.
 
 ## 10. Known limits and open work
 
-- **Context grows with the chain.** Nothing is trimmed, summarised or capped, so
-  the request body grows linearly with depth. Tool state is deliberately exempt:
-  it is not LLM-facing, so there is nothing to trim. See `TODO.md`.
+- **The context window truncates; it does not summarise.** A request drops the
+  oldest whole blocks once `context_window` (less the output cap) is spent, so a
+  long chain keeps working, at the cost of the model losing the memory of those
+  turns. A tool should describe its effects in its own result text rather than
+  rely on the model remembering the call. Tool state is deliberately exempt: it
+  is not LLM-facing, so there is nothing to trim. Summarising or pinning the
+  dropped blocks is still open — see `TODO.md`.
 - **One process per database file.** A second opener fails fast (an exclusive
   `flock` on `<path>.lock`) because two servers would keep two registries and
   silently disagree about which blocks exist.

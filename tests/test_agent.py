@@ -5,6 +5,7 @@ Every test drives a real `HHAgent` against the scripted fake provider in
 real; only the model itself is fake.
 """
 
+import base64
 import json
 import threading
 import time
@@ -2269,6 +2270,47 @@ class ToolPipeTests(HHTestCase):
         self.assertEqual(recorded["path"], "/workspace/out.bin")
         self.assertTrue(recorded["data"].startswith(f"<{len(payload)} bytes, sha256 "))
         self.assertNotIn("binary payload", recorded["data"])
+
+    def test_a_sandbox_file_may_be_piped_to_a_client_tool(self):
+        payload = b"\x00\x01binary payload nobody quotes"
+
+        self.provider.script(
+            Response.tool_call(
+                "nix_cat_file",
+                {
+                    "sandbox_id": "sbx-1",
+                    "path": "/workspace/out.bin",
+                    "tool_name": "save",
+                },
+                "c1",
+            ),
+            Response.text("done"),
+        )
+        block = self.root(
+            tools=[
+                tools.nix_cat_file_tool,
+                local_tool("save", params=[param("path"), param("data")]),
+            ]
+        ).fork("read it")
+        with mock.patch.object(sandbox_tools, "SANDBOXES") as registry:
+            registry.cat_file.return_value = payload
+            thread = self.turn(block)
+            called = thread.wait_event("local_tool_called", call_id="c1:pipe:1")
+            # a client-run tool is handed base64: its arguments are JSON
+            self.assertEqual(called["arguments"]["path"], "/workspace/out.bin")
+            self.assertEqual(base64.b64decode(called["arguments"]["data"]), payload)
+            self.assertTrue(
+                block.resolve_local_call("c1:pipe:1", "saved /workspace/out.bin")
+            )
+            thread.join()
+        self.assertIsNone(thread.error)
+        self.assertEqual(
+            block.messages[2]["content"],
+            "[tool pipe] nix_cat_file -> save\nsaved /workspace/out.bin",
+        )
+        # the client was answered by its own tool, and the provider saw no file
+        self.assertEqual(thread.last("local_tool_resolved")["next"], None)
+        self.assertNotIn("binary payload", json.dumps(self.provider.last_payload()))
 
     def test_the_context_carries_the_tool_registry(self):
         seen = {}

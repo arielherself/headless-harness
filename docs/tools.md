@@ -366,7 +366,7 @@ lucky.
 | `nix_remove_dependency` | `nix_remove_dependency` | removes a package; bash and coreutils cannot go |
 | `nix_exec` | `nix_exec` | runs one shell line; the timeout is required and at most 600s |
 | `nix_add_file` | `nix_add_file` | writes one base64 file (up to 200 MiB) into the writable `/workspace` |
-| `nix_cat_file` | `nix_cat_file` | reads one file (up to 200 MiB) and pipes its path and bytes to another tool |
+| `nix_cat_file` | `nix_cat_file` | reads one file (up to 200 MiB) and pipes its path and bytes to another tool (base64 to a client-run one) |
 | `nix_destroy_sandbox` | `nix_destroy_sandbox` | stops it and deletes its files now |
 
 The `magic` pair is the worked example of a shared namespace, and the pair used to
@@ -432,19 +432,22 @@ with `#!` is made executable.
 
 **`nix_cat_file` reads a file out, and hands it to another tool rather than to
 the model.** The file's path and its bytes become the named tool's first and
-second arguments — the content itself, not base64 and not a bare path — so the
-target has to be a server-side tool that declares exactly two parameters, and
-anything else (an unknown name, a client-run tool, the wrong number of
-parameters) is refused before a byte is read. The file may be up to 200 MiB,
-the same bound `nix_add_file` takes in the other direction; a larger file, a
-missing one, or a path the sandbox will not read is reported as text instead.
-A path outside a writable mount is read by running `cat` in the sandbox, so
-those reads are capped by the sandbox's own 64 MiB read cap rather than by this
-one. Nothing of the file reaches the conversation: the model sees the pipe's
-chain and the *last* tool's result, while the trace keeps only a size and a
-digest. This is how a binary artefact a command left under `/workspace` gets
-out of the sandbox — into a tool that uploads it, shows it or stores it — with
-the model never quoting a byte of it.
+second arguments, so the content itself moves tool to tool — nothing of it is
+quoted, shown or tokenised in the conversation. The target has to declare
+exactly two parameters, and a name that is unknown or does not fit is refused
+before a byte is read. A server-side tool is handed the bytes as they are; a
+client-run tool is handed them base64-encoded, because its arguments cross a
+JSON connection — the same encoding `nix_add_file` takes in the other direction,
+which means a full-size file reaches a client as roughly 267 MiB of base64 in
+one event line. The file may be up to 200 MiB, the bound `nix_add_file` accepts;
+a larger file, a missing one, or a path the sandbox will not read is reported as
+text instead. A path outside a writable mount is read by running `cat` in the
+sandbox, so those reads are capped by the sandbox's own 64 MiB read cap rather
+than by this one. Nothing of the file reaches the conversation: the model sees
+the pipe's chain and the *last* tool's result, while the trace keeps only a size
+and a digest. This is how a binary artefact a command left under `/workspace`
+gets out of the sandbox — into a tool that uploads it, shows it or stores it —
+with the model never quoting a byte of it.
 
 All of them but `nix_sandbox_status` and `nix_cat_file` declare `external_effects`:
 they create, destroy and change things outside the tool state, so a failed

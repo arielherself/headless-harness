@@ -533,6 +533,13 @@ Rules worth knowing:
 - **A client's piped `call` travels over this connection**, so the command-line
   cap applies to it — which is why the cap fits a full-size `nix_add_file`
   payload; a server-side pipe has no such limit.
+- **A step's arguments are Python values on the server and JSON on the wire.**
+  A step that runs on the client therefore cannot be handed `bytes`: anything
+  binary travels encoded, and base64 is the convention — it is what a client
+  sends `nix_add_file`, and what `nix_cat_file` sends a client-run tool. That
+  encoding is also what the line out costs: a 200 MiB file is about 267 MiB of
+  base64 in one `local_tool_called` line, and events have no size cap of their
+  own.
 
 ## Rollback
 

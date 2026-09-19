@@ -761,14 +761,21 @@ class CatFileToolTests(unittest.TestCase):
         self.context.tools["ping"] = server_tool("ping", lambda context: "")
         self.assertIn("0 parameters", self.cat(tool_name="ping"))
 
-    def test_a_tool_that_runs_on_the_client_is_refused(self):
+    def test_a_client_tool_is_handed_the_file_base64(self):
         self.context.tools["upload"] = local_tool(
             "upload", params=[param("path"), param("data")]
         )
-        text = self.cat(tool_name="upload")
-        self.assertIn("runs on the client", text)
-        self.assertIn("runs on the server", text)
-        self.registry.cat_file.assert_not_called()
+        piped = self.cat(tool_name="upload")
+        self.registry.cat_file.assert_called_once_with("sbx-1", "/workspace/out.bin")
+        # a client's arguments cross a JSON connection, where bytes have no form
+        self.assertEqual(
+            piped.call.arguments,
+            {
+                "path": "/workspace/out.bin",
+                "data": base64.b64encode(self.payload).decode("ascii"),
+            },
+        )
+        self.assertEqual(base64.b64decode(piped.call.arguments["data"]), self.payload)
 
 
 if __name__ == "__main__":

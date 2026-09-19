@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import platform
@@ -575,11 +576,11 @@ def _cat_file_target(context: ToolContext, name: Any) -> ToolEntry | str:
     """The tool `nix_cat_file` may hand a file to, or why it may not.
 
     The path and the bytes arrive as that tool's two arguments, in that order,
-    so it has to declare exactly two parameters — and it has to run on the
-    server: a client-run tool's arguments travel as JSON, where bytes have no
-    faithful form, so the file could not reach it intact. Both are answered as
-    text, before anything is read, rather than turning into a pipe the other end
-    cannot honour.
+    so it has to declare exactly two parameters. A server-side tool is handed
+    the bytes themselves; a client-run one is handed them base64-encoded,
+    because its arguments travel as JSON, where bytes have no faithful form.
+    A name that does not fit is answered as text, before anything is read,
+    rather than turning into a pipe the other end cannot honour.
     """
     if not isinstance(name, str) or not name.strip():
         return "Error: tool_name must name the tool that should receive the file."
@@ -587,18 +588,12 @@ def _cat_file_target(context: ToolContext, name: Any) -> ToolEntry | str:
     if tool is None:
         offered = ", ".join(sorted(context.tools)) or "none"
         return f"Error: unknown tool '{name}'; this block offers: {offered}."
-    if tool.is_local:
-        return (
-            f"Error: '{name}' runs on the client, and nix_cat_file hands the file "
-            "over as bytes, which cannot travel to a client; name a tool that runs "
-            "on the server."
-        )
     if len(tool.params) != 2:
         listed = ", ".join(param.name for param in tool.params) or "none"
         return (
             f"Error: '{name}' takes {len(tool.params)} parameters ({listed}); "
             "nix_cat_file hands the file to a tool that takes exactly two — the "
-            "path first, then the bytes."
+            "path first, then the bytes (base64 if the tool runs on the client)."
         )
     return tool
 
@@ -612,14 +607,16 @@ def nix_cat_file_executor(
     result = sandbox_tools.SANDBOXES.cat_file(sandbox_id, path)
     if isinstance(result, str):
         return result
+    # two arguments, in order: where the file was, then what was in it. A tool
+    # that runs on the server gets the bytes as they are, so nothing is copied
+    # or encoded on the way; one that runs on the client gets them base64, the
+    # only faithful form a JSON argument can carry
+    content = base64.b64encode(result).decode("ascii") if target.is_local else result
     return ToolResult(
         f"read {len(result)} bytes from {path} in sandbox {sandbox_id}",
-        # two arguments, in order: where the file was, then what was in it.
-        # The bytes are handed over as they are, so nothing is encoded, quoted
-        # or tokenised on the way
         call=ToolCall(
             target.name,
-            {target.params[0].name: path, target.params[1].name: result},
+            {target.params[0].name: path, target.params[1].name: content},
         ),
     )
 
@@ -631,12 +628,14 @@ nix_cat_file_tool = ToolEntry(
         "tool — never to you. The file's path and bytes become that tool's two "
         "arguments, in that order, so no part of the file is quoted, shown or "
         "tokenised in this conversation: this is how a large or binary file "
-        "gets out of a sandbox and into whatever handles it next. The file must "
-        "already exist in the sandbox and be at most 200 MiB; a missing file, "
-        "one the sandbox refuses to read, and a tool that does not exist, runs "
-        "on the client, or does not take exactly two parameters are all "
-        "reported instead of piped. The result you see is the named tool's own "
-        "result, prefixed with the pipe's chain."
+        "gets out of a sandbox and into whatever handles it next. A tool that "
+        "runs on the server receives the bytes themselves; one that runs on the "
+        "client receives them base64-encoded, because a client call is JSON. "
+        "The file must already exist in the sandbox and be at most 200 MiB; a "
+        "missing file, one the sandbox refuses to read, and a tool that does "
+        "not exist or does not take exactly two parameters are all reported "
+        "instead of piped. The result you see is the named tool's own result, "
+        "prefixed with the pipe's chain."
     ),
     params=[
         ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
@@ -649,8 +648,9 @@ nix_cat_file_tool = ToolEntry(
             name="tool_name",
             type="string",
             description=(
-                "name of a server-side tool that takes exactly two parameters; "
-                "it receives the file's path first, then its bytes"
+                "name of a tool that takes exactly two parameters; it receives "
+                "the file's path first, then its bytes (base64-encoded if the "
+                "tool runs on the client)"
             ),
         ),
     ],

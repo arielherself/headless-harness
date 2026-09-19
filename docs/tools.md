@@ -365,7 +365,7 @@ lucky.
 | `nix_add_dependency` | `nix_add_dependency` | installs one Nix package for the next command |
 | `nix_remove_dependency` | `nix_remove_dependency` | removes a package; bash and coreutils cannot go |
 | `nix_exec` | `nix_exec` | runs one shell line; the timeout is required and at most 600s |
-| `nix_add_file` | `nix_add_file` | writes one base64 file into the writable `/workspace` |
+| `nix_add_file` | `nix_add_file` | writes one base64 file (up to 200 MiB) into the writable `/workspace` |
 | `nix_destroy_sandbox` | `nix_destroy_sandbox` | stops it and deletes its files now |
 
 The `magic` pair is the worked example of a shared namespace, and the pair used to
@@ -424,7 +424,10 @@ outlives it is killed and the partial output is returned with exit code 124. Eac
 command runs in fresh namespaces, so background processes do not survive from one
 call to the next and only files under `/workspace` persist — which is where
 `nix_add_file` can put a file, handed over as a base64 string because a tool call
-is JSON. A file whose content starts with `#!` is made executable.
+is JSON. A file may be up to 200 MiB, which still leaves the sandbox's 512 MiB
+disk room for the commands that read it; a client moves one that large in by
+piping it rather than asking the model to quote it. A file whose content starts
+with `#!` is made executable.
 
 All of them but `nix_sandbox_status` declare `external_effects`: they create,
 destroy and change things outside the tool state, so a failed turn's note lists

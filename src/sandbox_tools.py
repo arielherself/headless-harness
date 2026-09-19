@@ -67,8 +67,11 @@ EXEC_TIMEOUT_MAX = 10 * 60.0
 EXEC_OUTPUT_MAX_CHARS = 20_000
 EXEC_CAPTURE_BYTES = 200_000
 # A file handed in as base64 in a tool call is bounded by the model's own
-# context, but the server should not allocate unboundedly on a bad caller.
-ADD_FILE_MAX_BYTES = 16 * 1024 * 1024
+# context, but the server should not allocate unboundedly on a bad caller. The
+# cap is 200 MiB — one file the sandbox's 512 MiB disk can hold with room for
+# the commands that read it, and the value the server's command-line limit is
+# sized from, since a client piping a file in sends it base64-encoded.
+ADD_FILE_MAX_BYTES = 200 * 1024 * 1024
 
 _IDLE_TEXT = f"{IDLE_TIMEOUT / 60:g} minutes"
 

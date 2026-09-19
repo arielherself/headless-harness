@@ -472,6 +472,16 @@ class AddFileTests(RegistryTestCase):
         self.assertIn("at most 16 bytes", text)
         self.assertEqual(self.created[0].files, {})
 
+    def test_add_file_takes_files_up_to_two_hundred_megabytes(self):
+        self.assertEqual(sandbox_tools.ADD_FILE_MAX_BYTES, 200 * 1024**2)
+
+    def test_add_file_allows_a_file_exactly_at_the_cap(self):
+        payload = base64.b64encode(b"x" * 64).decode("ascii")
+        with mock.patch.object(sandbox_tools, "ADD_FILE_MAX_BYTES", 64):
+            text = self.registry.add_file("sbx-0001", "/workspace/ok.bin", payload)
+        self.assertIn("Wrote 64 bytes", text)
+        self.assertEqual(self.created[0].files["/workspace/ok.bin"], b"x" * 64)
+
     def test_add_file_on_a_released_sandbox_says_so(self):
         self.registry.destroy("sbx-0001")
         self.assertIn("is not live", self.registry.add_file("sbx-0001", "/workspace/x", "aGk="))

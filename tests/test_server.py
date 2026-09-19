@@ -28,6 +28,7 @@ from tests.support import (
     agent,
     local_tool,
     pick,
+    sandbox_tools,
     server,
     store,
     tools,
@@ -284,6 +285,13 @@ class SessionTests(ServerTestCase):
         error = client.wait_error("r1", code="unknown_command")
         self.assertIn("levitate", error["message"])
         self.assertIn("ping", error["commands"])
+
+    def test_one_command_line_fits_the_largest_nix_add_file_payload(self):
+        # a client pipes a file in by answering resolve_tool with a call, so the
+        # biggest file nix_add_file takes has to fit in one line: base64 is
+        # ceil(n/3)*4 bytes, plus the small JSON envelope around it
+        encoded = (sandbox_tools.ADD_FILE_MAX_BYTES + 2) // 3 * 4
+        self.assertGreater(server.MAX_COMMAND_BYTES - encoded, 4096)
 
     def test_an_oversized_command_is_refused_and_closes_the_connection(self):
         fixture = self.start_server()

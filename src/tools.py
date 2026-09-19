@@ -549,9 +549,9 @@ nix_add_file_tool = ToolEntry(
     description=(
         "Write one file into a live sandbox at `path`, which must be under "
         "the writable /workspace. `content_base64` is the file's bytes, "
-        "base64-encoded, so text and binary files both work; a file whose "
-        "content starts with '#!' is made executable. The file lives as long "
-        "as the sandbox."
+        "base64-encoded, so text and binary files both work, up to 200 MiB "
+        "per call; a file whose content starts with '#!' is made executable. "
+        "The file lives as long as the sandbox."
     ),
     params=[
         ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),

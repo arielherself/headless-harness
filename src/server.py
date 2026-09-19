@@ -117,12 +117,18 @@ from agent import (
     image_content_parts,
 )
 from protocol import PROTOCOL_VERSION
+from sandbox_tools import ADD_FILE_MAX_BYTES
 from store import HHStore, HHStoreError
 from tools import ToolCall, ToolEntry, ToolParam, builtin_tools
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-MAX_COMMAND_BYTES = 8 * 1024 * 1024
+# The longest command line the server reads. It is sized from `nix_add_file`:
+# a client answers `resolve_tool` with a pipe call handing the tool a whole file
+# as base64, about 4/3 of the file's bytes, so 200 MiB arrives as a ~267 MiB
+# line plus the JSON around it. A server-side pipe never crosses this line, so
+# it is bound only by the tool's own cap.
+MAX_COMMAND_BYTES = ADD_FILE_MAX_BYTES * 4 // 3 + 2 * 1024 * 1024
 DEFAULT_MAX_DB_BYTES = 64 * 1024 * 1024
 
 COMMANDS: list[dict[str, Any]] = [
@@ -334,6 +340,9 @@ class HHHandler(socketserver.StreamRequestHandler):
                     )
                     break
                 text = line.decode("utf-8", errors="replace").strip()
+                # a line may be a ~268 MiB base64 payload, so each copy is let
+                # go as soon as the next one exists
+                del line
                 if not text:
                     continue
                 try:
@@ -346,6 +355,7 @@ class HHHandler(socketserver.StreamRequestHandler):
                         line=text[:200],
                     )
                     continue
+                del text  # the parsed command owns its strings
                 if not isinstance(command, dict):
                     conn.send(
                         "error",

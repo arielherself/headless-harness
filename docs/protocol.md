@@ -3,9 +3,11 @@
 The server speaks **newline-delimited JSON over TCP**: one JSON object per line,
 in both directions, UTF-8. Default `127.0.0.1:8765`, protocol version `4`.
 
-A line longer than 8 MiB is rejected with `command_too_large` and the connection
-closes. The server binds to loopback by default and has no authentication — it is
-a local harness, not a service.
+A line longer than ~268 MiB is rejected with `command_too_large` and the
+connection closes. The cap is sized so that a client can pipe a file into a
+sandbox: it is the largest file `nix_add_file` accepts (200 MiB), base64-encoded
+(about 267 MiB), plus room for the JSON around it. The server binds to loopback
+by default and has no authentication — it is a local harness, not a service.
 
 ## Framing
 
@@ -146,7 +148,7 @@ hand a provider a path to open either. A client that has a local file reads it
 itself and sends a `data:image/...` URI, which is what `test.py` does.
 
 Images ride in the same single JSON line as everything else, so a `data:` URI
-counts against the 8 MiB limit (base64 adds about a third). `prompt` stays
+counts against the command-line cap (base64 adds about a third). `prompt` stays
 required and non-empty: images ride along with text, they do not replace it.
 `image_count` reports how many parts a block holds without echoing the bytes.
 
@@ -528,8 +530,9 @@ Rules worth knowing:
   served for the life of the process, and a restarted block has none.
 - **Every step rolls back with the turn.** A failed, cancelled or abandoned turn
   offers each call it made an undo, the pipe's steps included, newest first.
-- **A client's piped `call` travels over this connection**, so the 8 MiB command
-  limit applies to it; a server-side pipe has no such limit.
+- **A client's piped `call` travels over this connection**, so the command-line
+  cap applies to it — which is why the cap fits a full-size `nix_add_file`
+  payload; a server-side pipe has no such limit.
 
 ## Rollback
 
@@ -626,7 +629,7 @@ client-run in its definition — or the note will quietly leave them out.
 |---|---|
 | `bad_json` | the line was not JSON |
 | `bad_command` | not a JSON object, or `command` is not a string |
-| `command_too_large` | over 8 MiB |
+| `command_too_large` | over the command-line cap (about 268 MiB) |
 | `unknown_command` | no such command; the reply lists the valid ones |
 | `bad_id` | `id` / `new_id` missing or not a non-empty string |
 | `bad_prompt` | `prompt` missing or empty |

@@ -98,6 +98,7 @@ class BuiltinToolTests(unittest.TestCase):
                 "nix_remove_dependency",
                 "nix_exec",
                 "nix_add_file",
+                "nix_cat_file",
                 "nix_destroy_sandbox",
             ],
         )

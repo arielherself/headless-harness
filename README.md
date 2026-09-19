@@ -149,7 +149,9 @@ tools the pipe called and the *last* call's output reach the model; every
 intermediate argument and result is reported live (`pipe_step_*` events, and
 `get_context` while the process lives), but never written to the database and
 never part of the transcript. That is what lets a download tool hand its bytes
-straight to `nix_add_file` without the model ever quoting a base64 payload.
+straight to `nix_add_file` without the model ever quoting a base64 payload, and
+what lets `nix_cat_file` hand a sandbox file's path and bytes to whatever tool
+handles it next.
 
 **And a turn that fails can undo itself.** A tool may declare a `rollback` hook —
 or, if it runs on the client, promise that the client has one — and when a turn

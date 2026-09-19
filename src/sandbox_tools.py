@@ -20,7 +20,10 @@ poll keeps a sandbox alive exactly as an exec does — and a call that is still
 running keeps it alive for its whole duration, so an install slower than the
 idle timeout cannot have its sandbox swept out from under it. Methods return
 the text a tool should hand the model instead of raising: an unknown id, a
-full registry and a failing command are normal answers, not crashes.
+full registry and a failing command are normal answers, not crashes. `cat_file`
+is the one exception in shape, not in spirit: a file it can read comes back as
+the bytes themselves, for the *next tool* to receive, and only a read that
+cannot happen falls back to text.
 """
 
 from __future__ import annotations
@@ -72,6 +75,11 @@ EXEC_CAPTURE_BYTES = 200_000
 # the commands that read it, and the value the server's command-line limit is
 # sized from, since a client piping a file in sends it base64-encoded.
 ADD_FILE_MAX_BYTES = 200 * 1024 * 1024
+# `nix_cat_file` moves a file out the other way, so the same 200 MiB applies:
+# what one sandbox can hold and what is still a bounded read for the harness.
+# The sandbox's own disk budget is what bounds the read below this check, so a
+# file past the limit costs one file's worth of memory and is then refused.
+CAT_FILE_MAX_BYTES = 200 * 1024 * 1024
 
 _IDLE_TEXT = f"{IDLE_TIMEOUT / 60:g} minutes"
 
@@ -282,6 +290,36 @@ class SandboxRegistry:
                 return _failure(f"could not write {path} in sandbox {sandbox_id}", exc)
             note = " (executable: it starts with '#!')" if data.startswith(b"#!") else ""
             return f"Wrote {len(data)} bytes to {path} in sandbox {sandbox_id}{note}."
+
+    def cat_file(self, sandbox_id: str, path: Any) -> bytes | str:
+        """Read one file out of a sandbox: its bytes, or the text to report instead.
+
+        The bytes are the point — they are on their way to another tool, not to
+        the model — so a successful read hands them back as they are, and every
+        other outcome is the sentence a tool should pass on: a gone sandbox, a
+        path that is not absolute, one the sandbox will not read, or a file past
+        `CAT_FILE_MAX_BYTES`.
+        """
+        with self._using(sandbox_id) as entry:
+            if entry is None:
+                return self._gone_text(sandbox_id)
+            if not isinstance(path, str) or not path.startswith("/"):
+                return (
+                    "Error: path must be an absolute path inside the sandbox, "
+                    f"e.g. {SANDBOX_WORKSPACE}/output.bin; got {_short(path)}."
+                )
+            try:
+                data = entry.sandbox.get_file(path)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                # the sandbox's own message already names the path and the reason
+                return _failure(f"{path} is not readable in sandbox {sandbox_id}", exc)
+            if len(data) > CAT_FILE_MAX_BYTES:
+                return (
+                    f"Error: {path} is {len(data)} bytes, over the {CAT_FILE_MAX_BYTES} "
+                    "byte nix_cat_file limit; use nix_exec to work on it in pieces "
+                    "inside the sandbox (head, split, ...) instead of reading it whole."
+                )
+            return data
 
     # -- sweeping -----------------------------------------------------------
 

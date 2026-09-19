@@ -366,6 +366,7 @@ lucky.
 | `nix_remove_dependency` | `nix_remove_dependency` | removes a package; bash and coreutils cannot go |
 | `nix_exec` | `nix_exec` | runs one shell line; the timeout is required and at most 600s |
 | `nix_add_file` | `nix_add_file` | writes one base64 file (up to 200 MiB) into the writable `/workspace` |
+| `nix_cat_file` | `nix_cat_file` | reads one file (up to 200 MiB) and pipes its path and bytes to another tool |
 | `nix_destroy_sandbox` | `nix_destroy_sandbox` | stops it and deletes its files now |
 
 The `magic` pair is the worked example of a shared namespace, and the pair used to
@@ -429,9 +430,27 @@ disk room for the commands that read it; a client moves one that large in by
 piping it rather than asking the model to quote it. A file whose content starts
 with `#!` is made executable.
 
-All of them but `nix_sandbox_status` declare `external_effects`: they create,
-destroy and change things outside the tool state, so a failed turn's note lists
-them rather than letting the next model assume the environment is clean.
+**`nix_cat_file` reads a file out, and hands it to another tool rather than to
+the model.** The file's path and its bytes become the named tool's first and
+second arguments — the content itself, not base64 and not a bare path — so the
+target has to be a server-side tool that declares exactly two parameters, and
+anything else (an unknown name, a client-run tool, the wrong number of
+parameters) is refused before a byte is read. The file may be up to 200 MiB,
+the same bound `nix_add_file` takes in the other direction; a larger file, a
+missing one, or a path the sandbox will not read is reported as text instead.
+A path outside a writable mount is read by running `cat` in the sandbox, so
+those reads are capped by the sandbox's own 64 MiB read cap rather than by this
+one. Nothing of the file reaches the conversation: the model sees the pipe's
+chain and the *last* tool's result, while the trace keeps only a size and a
+digest. This is how a binary artefact a command left under `/workspace` gets
+out of the sandbox — into a tool that uploads it, shows it or stores it — with
+the model never quoting a byte of it.
+
+All of them but `nix_sandbox_status` and `nix_cat_file` declare `external_effects`:
+they create, destroy and change things outside the tool state, so a failed
+turn's note lists them rather than letting the next model assume the environment
+is clean. Both of those only read, and whatever `nix_cat_file` pipes to answers
+for its own effects.
 
 ## Checklist
 

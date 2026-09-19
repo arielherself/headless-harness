@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sandbox import ExecResult, SandboxError
-from tests.support import sandbox_tools, tools
+from tests.support import local_tool, param, sandbox_tools, server_tool, tools
 
 
 class FakeClock:
@@ -83,6 +83,14 @@ class FakeSandbox:
         if not (path == "/workspace" or path.startswith("/workspace/")):
             raise SandboxError(f"{path} is not under a writable mount: ['/workspace']")
         self.files[path] = bytes(data)
+
+    def get_file(self, path):
+        self._fail_if_asked()
+        if path.startswith("/tmp/"):
+            raise SandboxError(f"{path} is on a tmpfs, which exists for one command and is gone")
+        if path not in self.files:
+            raise SandboxError(f"could not read {path}: No such file or directory")
+        return self.files[path]
 
     def destroy(self):
         self.destroyed = True
@@ -487,6 +495,63 @@ class AddFileTests(RegistryTestCase):
         self.assertIn("is not live", self.registry.add_file("sbx-0001", "/workspace/x", "aGk="))
 
 
+class CatFileTests(RegistryTestCase):
+    def setUp(self):
+        self.registry, self.created = self.make()
+        self.registry.spawn()
+
+    def test_cat_file_returns_the_bytes(self):
+        payload = bytes(range(256))
+        self.created[0].files["/workspace/out.bin"] = payload
+        self.assertEqual(self.registry.cat_file("sbx-0001", "/workspace/out.bin"), payload)
+
+    def test_cat_file_reads_an_empty_file(self):
+        self.created[0].files["/workspace/empty.txt"] = b""
+        self.assertEqual(self.registry.cat_file("sbx-0001", "/workspace/empty.txt"), b"")
+
+    def test_cat_file_rejects_a_relative_path(self):
+        text = self.registry.cat_file("sbx-0001", "workspace/out.bin")
+        self.assertTrue(text.startswith("Error:"))
+        self.assertIn("absolute", text)
+
+    def test_cat_file_reports_a_file_the_sandbox_will_not_read(self):
+        text = self.registry.cat_file("sbx-0001", "/tmp/scratch.bin")
+        self.assertTrue(text.startswith("Error:"))
+        self.assertIn("tmpfs", text)
+
+    def test_cat_file_reports_a_missing_file(self):
+        text = self.registry.cat_file("sbx-0001", "/workspace/gone.bin")
+        self.assertTrue(text.startswith("Error:"))
+        self.assertIn("No such file or directory", text)
+
+    def test_cat_file_reports_a_sandbox_failure(self):
+        self.created[0].failure = SandboxError("the sandbox has been destroyed")
+        text = self.registry.cat_file("sbx-0001", "/workspace/out.bin")
+        self.assertTrue(text.startswith("Error:"))
+        self.assertIn("the sandbox has been destroyed", text)
+
+    def test_cat_file_refuses_a_file_past_the_limit(self):
+        with mock.patch.object(sandbox_tools, "CAT_FILE_MAX_BYTES", 16):
+            self.created[0].files["/workspace/big.bin"] = b"x" * 17
+            text = self.registry.cat_file("sbx-0001", "/workspace/big.bin")
+        self.assertTrue(text.startswith("Error:"))
+        self.assertIn("17 bytes", text)
+        self.assertIn("16 byte nix_cat_file limit", text)
+        self.assertIn("nix_exec", text)
+
+    def test_cat_file_allows_a_file_exactly_at_the_limit(self):
+        with mock.patch.object(sandbox_tools, "CAT_FILE_MAX_BYTES", 64):
+            self.created[0].files["/workspace/ok.bin"] = b"x" * 64
+            self.assertEqual(self.registry.cat_file("sbx-0001", "/workspace/ok.bin"), b"x" * 64)
+
+    def test_cat_file_takes_files_up_to_two_hundred_megabytes(self):
+        self.assertEqual(sandbox_tools.CAT_FILE_MAX_BYTES, 200 * 1024**2)
+
+    def test_cat_file_on_a_released_sandbox_says_so(self):
+        self.registry.destroy("sbx-0001")
+        self.assertIn("is not live", self.registry.cat_file("sbx-0001", "/workspace/out.bin"))
+
+
 class DestroyTests(RegistryTestCase):
     def test_destroy_stops_the_sandbox_and_frees_the_slot(self):
         registry, created = self.make()
@@ -515,7 +580,15 @@ class ToolWiringTests(unittest.TestCase):
     """The ToolEntry hooks are thin: they hand their arguments to the registry."""
 
     def setUp(self):
-        self.context = SimpleNamespace()
+        self.context = SimpleNamespace(
+            tools={
+                "consume": server_tool(
+                    "consume",
+                    lambda context, path, data: "",
+                    params=[param("path"), param("data")],
+                )
+            }
+        )
 
     def test_the_hooks_call_the_module_registry(self):
         with mock.patch.object(sandbox_tools, "SANDBOXES") as registry:
@@ -525,6 +598,7 @@ class ToolWiringTests(unittest.TestCase):
             registry.remove_dependency.return_value = "removed"
             registry.exec.return_value = "executed"
             registry.add_file.return_value = "written"
+            registry.cat_file.return_value = b"bytes"
             registry.destroy.return_value = "destroyed"
 
             self.assertEqual(tools.nix_spawn_sandbox_executor(self.context), "spawned")
@@ -553,12 +627,20 @@ class ToolWiringTests(unittest.TestCase):
                 ),
                 "written",
             )
+            piped = tools.nix_cat_file_executor(
+                self.context, sandbox_id="sbx-1", path="/workspace/x", tool_name="consume"
+            )
+            self.assertEqual(
+                piped.call,
+                tools.ToolCall("consume", {"path": "/workspace/x", "data": b"bytes"}),
+            )
             self.assertEqual(
                 tools.nix_destroy_sandbox_executor(self.context, sandbox_id="sbx-1"), "destroyed"
             )
 
         registry.exec.assert_called_once_with("sbx-1", "true", 30)
         registry.add_file.assert_called_once_with("sbx-1", "/workspace/x", "aGk=")
+        registry.cat_file.assert_called_once_with("sbx-1", "/workspace/x")
 
     def test_spawn_takes_no_parameters(self):
         tool = next(tool for tool in tools.builtin_tools if tool.name == "nix_spawn_sandbox")
@@ -570,6 +652,13 @@ class ToolWiringTests(unittest.TestCase):
         self.assertEqual(tool.params[-1].type, "integer")
         self.assertIn("600", tool.params[-1].description)
 
+    def test_cat_file_takes_a_sandbox_a_path_and_a_target_tool(self):
+        tool = next(tool for tool in tools.builtin_tools if tool.name == "nix_cat_file")
+        self.assertEqual(
+            [param.name for param in tool.params], ["sandbox_id", "path", "tool_name"]
+        )
+        self.assertIn("200 MiB", tool.description)
+
     def test_the_sandbox_tools_declare_their_effects(self):
         for tool in tools.builtin_tools:
             if not tool.name.startswith("nix_"):
@@ -579,10 +668,107 @@ class ToolWiringTests(unittest.TestCase):
                 self.assertFalse(tool.has_rollback)
                 self.assertTrue(tool.description)
                 self.assertEqual(tool.namespace, tool.name)
-                if tool.name == "nix_sandbox_status":
+                if tool.name in ("nix_sandbox_status", "nix_cat_file"):
                     self.assertFalse(tool.external_effects)
                 else:
                     self.assertTrue(tool.external_effects)
+
+
+class CatFileToolTests(unittest.TestCase):
+    """A read file becomes the target tool's two arguments: path, then bytes."""
+
+    def setUp(self):
+        self.payload = bytes(range(64))
+        self.registry = mock.MagicMock()
+        self.registry.cat_file.return_value = self.payload
+        patcher = mock.patch.object(sandbox_tools, "SANDBOXES", self.registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.context = SimpleNamespace(tools={})
+        self.context.tools["consume"] = server_tool(
+            "consume",
+            lambda context, path, data: "",
+            params=[param("path"), param("data")],
+        )
+
+    def cat(self, tool_name="consume", path="/workspace/out.bin", sandbox_id="sbx-1"):
+        return tools.nix_cat_file_executor(
+            self.context, sandbox_id=sandbox_id, path=path, tool_name=tool_name
+        )
+
+    def test_the_path_and_the_bytes_become_the_two_arguments(self):
+        result = self.cat()
+        self.registry.cat_file.assert_called_once_with("sbx-1", "/workspace/out.bin")
+        self.assertIsInstance(result, tools.ToolResult)
+        self.assertEqual(
+            result.call,
+            tools.ToolCall("consume", {"path": "/workspace/out.bin", "data": self.payload}),
+        )
+        # the note is for the trace: it never reaches the model, the pipe does
+        self.assertEqual(
+            result.text, "read 64 bytes from /workspace/out.bin in sandbox sbx-1"
+        )
+
+    def test_the_arguments_follow_the_targets_own_parameter_order(self):
+        self.context.tools["store"] = server_tool(
+            "store",
+            lambda context, name, payload: "",
+            params=[param("name"), param("payload")],
+        )
+        piped = self.cat(tool_name="store")
+        self.assertEqual(
+            piped.call.arguments,
+            {"name": "/workspace/out.bin", "payload": self.payload},
+        )
+
+    def test_a_read_that_fails_is_text_not_a_pipe(self):
+        self.registry.cat_file.return_value = "Error: sandbox sbx-1 is not live"
+        self.assertEqual(self.cat(), "Error: sandbox sbx-1 is not live")
+
+    def test_a_missing_tool_name_is_refused_before_anything_is_read(self):
+        text = self.cat(tool_name="")
+        self.assertTrue(text.startswith("Error:"))
+        self.assertIn("tool_name", text)
+        self.registry.cat_file.assert_not_called()
+
+    def test_an_unknown_tool_is_refused_before_anything_is_read(self):
+        text = self.cat(tool_name="nowhere")
+        self.assertIn("unknown tool 'nowhere'", text)
+        self.assertIn("consume", text)
+        self.registry.cat_file.assert_not_called()
+
+    def test_a_tool_that_takes_too_many_parameters_is_refused(self):
+        self.context.tools["write"] = server_tool(
+            "write",
+            lambda context, path, data, mode: "",
+            params=[param("path"), param("data"), param("mode")],
+        )
+        text = self.cat(tool_name="write")
+        self.assertIn("3 parameters (path, data, mode)", text)
+        self.assertIn("exactly two", text)
+        self.registry.cat_file.assert_not_called()
+
+    def test_a_tool_that_takes_one_parameter_is_refused(self):
+        self.context.tools["show"] = server_tool(
+            "show", lambda context, data: "", params=[param("data")]
+        )
+        text = self.cat(tool_name="show")
+        self.assertIn("1 parameters (data)", text)
+        self.assertIn("exactly two", text)
+        self.registry.cat_file.assert_not_called()
+
+    def test_a_tool_that_takes_no_parameters_is_refused(self):
+        self.context.tools["ping"] = server_tool("ping", lambda context: "")
+        self.assertIn("0 parameters", self.cat(tool_name="ping"))
+
+    def test_a_tool_that_runs_on_the_client_is_refused(self):
+        self.context.tools["upload"] = local_tool(
+            "upload", params=[param("path"), param("data")]
+        )
+        text = self.cat(tool_name="upload")
+        self.assertIn("runs on the client", text)
+        self.assertIn("runs on the server", text)
+        self.registry.cat_file.assert_not_called()
 
 
 if __name__ == "__main__":

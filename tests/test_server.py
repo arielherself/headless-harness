@@ -148,6 +148,7 @@ class SessionTests(ServerTestCase):
                 "nix_remove_dependency",
                 "nix_exec",
                 "nix_add_file",
+                "nix_cat_file",
                 "nix_destroy_sandbox",
             ],
         )
@@ -378,6 +379,7 @@ class CreateAgentTests(ServerTestCase):
                 "get_system_info",
                 "nix_add_dependency",
                 "nix_add_file",
+                "nix_cat_file",
                 "nix_destroy_sandbox",
                 "nix_exec",
                 "nix_remove_dependency",
@@ -388,7 +390,7 @@ class CreateAgentTests(ServerTestCase):
                 "web_search",
             ],
         )
-        self.assertEqual(len(created["tool_schemas"]), 13)
+        self.assertEqual(len(created["tool_schemas"]), 14)
 
     def test_an_id_is_generated_when_omitted(self):
         fixture = self.start_server()
@@ -604,6 +606,7 @@ class ForkTests(ServerTestCase):
                 "get_system_info",
                 "nix_add_dependency",
                 "nix_add_file",
+                "nix_cat_file",
                 "nix_destroy_sandbox",
                 "nix_exec",
                 "nix_remove_dependency",

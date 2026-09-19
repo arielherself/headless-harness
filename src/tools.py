@@ -571,6 +571,96 @@ nix_add_file_tool = ToolEntry(
 )
 
 
+def _cat_file_target(context: ToolContext, name: Any) -> ToolEntry | str:
+    """The tool `nix_cat_file` may hand a file to, or why it may not.
+
+    The path and the bytes arrive as that tool's two arguments, in that order,
+    so it has to declare exactly two parameters — and it has to run on the
+    server: a client-run tool's arguments travel as JSON, where bytes have no
+    faithful form, so the file could not reach it intact. Both are answered as
+    text, before anything is read, rather than turning into a pipe the other end
+    cannot honour.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return "Error: tool_name must name the tool that should receive the file."
+    tool = context.tools.get(name)
+    if tool is None:
+        offered = ", ".join(sorted(context.tools)) or "none"
+        return f"Error: unknown tool '{name}'; this block offers: {offered}."
+    if tool.is_local:
+        return (
+            f"Error: '{name}' runs on the client, and nix_cat_file hands the file "
+            "over as bytes, which cannot travel to a client; name a tool that runs "
+            "on the server."
+        )
+    if len(tool.params) != 2:
+        listed = ", ".join(param.name for param in tool.params) or "none"
+        return (
+            f"Error: '{name}' takes {len(tool.params)} parameters ({listed}); "
+            "nix_cat_file hands the file to a tool that takes exactly two — the "
+            "path first, then the bytes."
+        )
+    return tool
+
+
+def nix_cat_file_executor(
+    context: ToolContext, sandbox_id: str, path: str, tool_name: str
+) -> str | ToolResult:
+    target = _cat_file_target(context, tool_name)
+    if isinstance(target, str):
+        return target
+    result = sandbox_tools.SANDBOXES.cat_file(sandbox_id, path)
+    if isinstance(result, str):
+        return result
+    return ToolResult(
+        f"read {len(result)} bytes from {path} in sandbox {sandbox_id}",
+        # two arguments, in order: where the file was, then what was in it.
+        # The bytes are handed over as they are, so nothing is encoded, quoted
+        # or tokenised on the way
+        call=ToolCall(
+            target.name,
+            {target.params[0].name: path, target.params[1].name: result},
+        ),
+    )
+
+
+nix_cat_file_tool = ToolEntry(
+    name="nix_cat_file",
+    description=(
+        "Read one file out of a live sandbox and hand its content to another "
+        "tool — never to you. The file's path and bytes become that tool's two "
+        "arguments, in that order, so no part of the file is quoted, shown or "
+        "tokenised in this conversation: this is how a large or binary file "
+        "gets out of a sandbox and into whatever handles it next. The file must "
+        "already exist in the sandbox and be at most 200 MiB; a missing file, "
+        "one the sandbox refuses to read, and a tool that does not exist, runs "
+        "on the client, or does not take exactly two parameters are all "
+        "reported instead of piped. The result you see is the named tool's own "
+        "result, prefixed with the pipe's chain."
+    ),
+    params=[
+        ToolParam(name="sandbox_id", type="string", description="the id nix_spawn_sandbox returned"),
+        ToolParam(
+            name="path",
+            type="string",
+            description="absolute path of the file to read, e.g. /workspace/result.bin",
+        ),
+        ToolParam(
+            name="tool_name",
+            type="string",
+            description=(
+                "name of a server-side tool that takes exactly two parameters; "
+                "it receives the file's path first, then its bytes"
+            ),
+        ),
+    ],
+    hook=nix_cat_file_executor,
+    # a read, like nix_sandbox_status: it changes nothing itself, and whatever
+    # the tool it pipes to does is recorded as that call's own effects
+    external_effects=False,
+)
+
+
 def nix_destroy_sandbox_executor(context: ToolContext, sandbox_id: str) -> str:
     return sandbox_tools.SANDBOXES.destroy(sandbox_id)
 
@@ -603,5 +693,6 @@ builtin_tools = [
     nix_remove_dependency_tool,
     nix_exec_tool,
     nix_add_file_tool,
+    nix_cat_file_tool,
     nix_destroy_sandbox_tool,
 ]

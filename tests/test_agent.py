@@ -23,6 +23,7 @@ from tests.support import (
     local_tool,
     param,
     pick,
+    sandbox_tools,
     server_tool,
     tools,
     usage,
@@ -334,6 +335,7 @@ class RootAndForkTests(HHTestCase):
                 "get_system_info",
                 "nix_add_dependency",
                 "nix_add_file",
+                "nix_cat_file",
                 "nix_destroy_sandbox",
                 "nix_exec",
                 "nix_remove_dependency",
@@ -2218,6 +2220,55 @@ class ToolPipeTests(HHTestCase):
         self.assertIn("8 bytes", recorded)
         self.assertIn("sha256", recorded)
         self.assertEqual(block.messages[2]["content"], "[tool pipe] fetch -> copy\ngot 8 bytes")
+
+    def test_a_sandbox_file_reaches_a_tool_without_entering_the_transcript(self):
+        payload = b"\x00\x01binary payload nobody quotes"
+        consumed = []
+
+        def consume(context, path, data):
+            consumed.append((path, data))
+            return f"consumed {len(data)} bytes"
+
+        self.provider.script(
+            Response.tool_call(
+                "nix_cat_file",
+                {
+                    "sandbox_id": "sbx-1",
+                    "path": "/workspace/out.bin",
+                    "tool_name": "consume",
+                },
+                "c1",
+            ),
+            Response.text("done"),
+        )
+        block = self.root(
+            tools=[
+                tools.nix_cat_file_tool,
+                server_tool(
+                    "consume",
+                    consume,
+                    params=[param("path"), param("data")],
+                ),
+            ]
+        ).fork("read it")
+        with mock.patch.object(sandbox_tools, "SANDBOXES") as registry:
+            registry.cat_file.return_value = payload
+            self.run_turn(block)
+
+        registry.cat_file.assert_called_once_with("sbx-1", "/workspace/out.bin")
+        # the path arrived first and the file arrived whole, as its second
+        self.assertEqual(consumed, [("/workspace/out.bin", payload)])
+        self.assertEqual(
+            block.messages[2]["content"],
+            f"[tool pipe] nix_cat_file -> consume\nconsumed {len(payload)} bytes",
+        )
+        # tool handed it to tool, so the provider was never shown any of it
+        self.assertNotIn("binary payload", json.dumps(self.provider.last_payload()))
+        # and the trace keeps the truth about the value, never the value
+        recorded = block.pipe_traces[0]["steps"][1]["arguments"]
+        self.assertEqual(recorded["path"], "/workspace/out.bin")
+        self.assertTrue(recorded["data"].startswith(f"<{len(payload)} bytes, sha256 "))
+        self.assertNotIn("binary payload", recorded["data"])
 
     def test_the_context_carries_the_tool_registry(self):
         seen = {}
